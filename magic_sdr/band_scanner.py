@@ -169,7 +169,7 @@ class BandScanner(QObject):
                 if not self.gqrx.set_frequency(f):
                     continue
                 time.sleep(max(0.2, self.dwell_s * 0.6))
-                lvl = self.gqrx.get_signal_level()
+                lvl = self.gqrx.get_signal_level_robust(n_samples=2, interval_s=0.05)
                 if lvl is not None:
                     levels.append(lvl)
             if not levels:
@@ -197,6 +197,9 @@ class BandScanner(QObject):
         self._running = True
         self.scan_started.emit(band.name)
         found: List[DiscoveredStation] = []
+        # Pause Gqrx's background poller so it doesn't interleave f/m/l
+        # commands with our scan commands on the same TCP socket.
+        self.gqrx.pause_poller()
         try:
             if not self.gqrx.is_connected():
                 self.scan_error.emit("Gqrx not connected")
@@ -227,7 +230,9 @@ class BandScanner(QObject):
                 if not self.gqrx.set_frequency(f):
                     continue
                 time.sleep(self.dwell_s)
-                lvl = self.gqrx.get_signal_level()
+                # Use the robust sampler (max of 3 quick samples) so we don't
+                # miss a carrier because we sampled during a fade.
+                lvl = self.gqrx.get_signal_level_robust(n_samples=3, interval_s=0.04)
                 if lvl is None:
                     continue
                 # Always emit level for live diagnostic — useful even if
@@ -251,3 +256,5 @@ class BandScanner(QObject):
             self.scan_error.emit(f"Scan failed: {e}")
         finally:
             self._running = False
+            # Restart the background poller so the UI keeps showing live freq/level.
+            self.gqrx.resume_poller()

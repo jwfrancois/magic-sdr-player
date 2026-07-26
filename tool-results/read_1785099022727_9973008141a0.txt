@@ -1,0 +1,919 @@
+     1→     1→"""Main window — assembles the GUI from all components.
+     2→     2→
+     3→     3→Layout:
+     4→     4→  ┌──────────────────────────────────────────────────────────────┐
+     5→     5→  │ Top bar:    connection status · frequency · modulation · gain │
+     6→     6→  ├─────────────────────┬────────────────────────────────────────┤
+     7→     7→  │  Tuner (left col):  │  Waterfall (right col):                 │
+     8→     8→  │   - Frequency dial  │   - Spectrum + waterfall                │
+     9→     9→  │   - Modulation box  │                                         │
+    10→    10→  │   - Volume / mute   │                                         │
+    11→    11→  │   - Signal level    │                                         │
+    12→    12→  │   - Record button   │                                         │
+    13→    13→  ├─────────────────────┴────────────────────────────────────────┤
+    14→    14→  │  Tabs: Bookmarks | Scanner | Recordings | Settings            │
+    15→    15→  └──────────────────────────────────────────────────────────────┘
+    16→    16→
+    17→    17→The window owns all top-level objects (GqrxClient, AudioReceiver, etc.) and
+    18→    18→wires their signals together. It runs the embedded web server in a thread so
+    19→    19→the GUI stays responsive.
+    20→    20→"""
+    21→    21→
+    22→    22→from __future__ import annotations
+    23→    23→
+    24→    24→import logging
+    25→    25→import time
+    26→    26→from typing import Optional
+    27→    27→
+    28→    28→import numpy as np
+    29→    29→from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+    30→    30→from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
+    31→    31→from PyQt5.QtWidgets import (
+    32→    32→    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QTabWidget,
+    33→    33→    QLabel, QPushButton, QComboBox, QSlider, QLineEdit, QSpinBox, QDoubleSpinBox,
+    34→    34→    QListWidget, QListWidgetItem, QProgressBar, QStatusBar, QMessageBox,
+    35→    35→    QGroupBox, QFormLayout, QCheckBox, QFileDialog, QSplitter, QFrame,
+    36→    36→    QApplication, QStyle
+    37→    37→)
+    38→    38→
+    39→    39→from .gqrx_client import GqrxClient, MODULATIONS
+    40→    40→from .audio_receiver import AudioReceiver, AudioPlayer
+    41→    41→from .spectrum import SpectrumReceiver, WaterfallWidget
+    42→    42→from .band_scanner import BandScanner, DiscoveredStation
+    43→    43→from .bookmark_manager import BookmarkManager, Bookmark
+    44→    44→from .recording_manager import RecordingManager
+    45→    45→from .ai_tagger import AITagger
+    46→    46→from .web_server import WebServer
+    47→    47→from .band_presets import BANDS, BANDS_BY_NAME, band_for_frequency, lookup_known, guess_modulation
+    48→    48→from .config import Config
+    49→    49→
+    50→    50→log = logging.getLogger(__name__)
+    51→    51→
+    52→    52→
+    53→    53→class FrequencyDial(QWidget):
+    54→    54→    """A digital frequency display + tuning buttons."""
+    55→    55→    tune_requested = pyqtSignal(int)
+    56→    56→
+    57→    57→    def __init__(self, parent=None):
+    58→    58→        super().__init__(parent)
+    59→    59→        self.freq_hz = 96_900_000
+    60→    60→        layout = QVBoxLayout(self)
+    61→    61→        layout.setContentsMargins(0, 0, 0, 0)
+    62→    62→
+    63→    63→        # Big frequency display
+    64→    64→        self.display = QLabel("96.900000 MHz")
+    65→    65→        f = QFont("JetBrains Mono", 32)
+    66→    66→        f.setWeight(QFont.Light)
+    67→    67→        self.display.setFont(f)
+    68→    68→        self.display.setStyleSheet("color: #5cd9ff; padding: 8px;")
+    69→    69→        self.display.setAlignment(Qt.AlignCenter)
+    70→    70→        layout.addWidget(self.display)
+    71→    71→
+    72→    72→        # Tuning buttons: -100k -10k -1k | entry | +1k +10k +100k
+    73→    73→        row = QHBoxLayout()
+    74→    74→        for step, label in [(-100_000, "−100k"), (-10_000, "−10k"), (-1_000, "−1k")]:
+    75→    75→            btn = QPushButton(label)
+    76→    76→            btn.clicked.connect(lambda _, s=step: self.tune_requested.emit(self.freq_hz + s))
+    77→    77→            row.addWidget(btn)
+    78→    78→        self.entry = QLineEdit()
+    79→    79→        self.entry.setPlaceholderText("MHz")
+    80→    80→        self.entry.setFixedWidth(120)
+    81→    81→        self.entry.returnPressed.connect(self._on_entry)
+    82→    82→        row.addWidget(self.entry)
+    83→    83→        for step, label in [(1_000, "+1k"), (10_000, "+10k"), (100_000, "+100k")]:
+    84→    84→            btn = QPushButton(label)
+    85→    85→            btn.clicked.connect(lambda _, s=step: self.tune_requested.emit(self.freq_hz + s))
+    86→    86→            row.addWidget(btn)
+    87→    87→        layout.addLayout(row)
+    88→    88→
+    89→    89→    def set_frequency(self, freq_hz: int) -> None:
+    90→    90→        self.freq_hz = int(freq_hz)
+    91→    91→        self.display.setText(f"{self.freq_hz / 1e6:.6f} MHz")
+    92→    92→
+    93→    93→    def _on_entry(self) -> None:
+    94→    94→        try:
+    95→    95→            mhz = float(self.entry.text())
+    96→    96→            self.tune_requested.emit(int(mhz * 1e6))
+    97→    97→        except ValueError:
+    98→    98→            pass
+    99→    99→
+   100→   100→
+   101→   101→class MainWindow(QMainWindow):
+   102→   102→    """Top-level window that wires all components together."""
+   103→   103→
+   104→   104→    def __init__(self, config: Config):
+   105→   105→        super().__init__()
+   106→   106→        self.config = config
+   107→   107→        self.setWindowTitle("Magic SDR Player — RTL-SDR V3 + Gqrx")
+   108→   108→        self.resize(config.window_width, config.window_height)
+   109→   109→
+   110→   110→        # ----------------------------- core components -----------------------------
+   111→   111→        self.gqrx = GqrxClient(host=config.gqrx_host, port=config.gqrx_port)
+   112→   112→        self.audio_receiver = AudioReceiver(
+   113→   113→            port=config.audio_port,
+   114→   114→            sample_rate=config.audio_sample_rate,
+   115→   115→            channels=config.audio_channels,
+   116→   116→        )
+   117→   117→        self.audio_player = AudioPlayer(
+   118→   118→            sample_rate=config.audio_sample_rate,
+   119→   119→            channels=config.audio_channels,
+   120→   120→        )
+   121→   121→        self.audio_player.set_volume(config.volume)
+   122→   122→        self.spectrum_receiver = SpectrumReceiver(port=config.spectrum_port)
+   123→   123→        self.bookmarks = BookmarkManager()
+   124→   124→        self.recordings = RecordingManager()
+   125→   125→        self.scanner = BandScanner(self.gqrx)
+   126→   126→        self.scanner.threshold_db = config.scan_threshold_db
+   127→   127→        self.scanner.dwell_s = config.scan_dwell_s
+   128→   128→        self.ai_tagger = AITagger()
+   129→   129→        self.ai_tagger.enabled = config.ai_tagging_enabled
+   130→   130→        self.scanner.ai_tagger = self.ai_tagger if self.ai_tagger.enabled else None
+   131→   131→
+   132→   132→        # Web server (starts after the rest is wired)
+   133→   133→        self.web_server: Optional[WebServer] = None
+   134→   134→
+   135→   135→        # ----------------------------- build UI -----------------------------
+   136→   136→        self._build_ui()
+   137→   137→
+   138→   138→        # ----------------------------- wire signals -----------------------------
+   139→   139→        self._wire_signals()
+   140→   140→
+   141→   141→        # ----------------------------- periodic timers -----------------------------
+   142→   142→        # Status poller
+   143→   143→        self.status_timer = QTimer(self)
+   144→   144→        self.status_timer.setInterval(500)
+   145→   145→        self.status_timer.timeout.connect(self._update_status)
+   146→   146→        self.status_timer.start()
+   147→   147→
+   148→   148→        # Apply initial state
+   149→   149→        self._apply_config()
+   150→   150→
+   151→   151→    # ----------------------------- UI construction -----------------------------
+   152→   152→    def _build_ui(self) -> None:
+   153→   153→        central = QWidget()
+   154→   154→        self.setCentralWidget(central)
+   155→   155→        root = QVBoxLayout(central)
+   156→   156→
+   157→   157→        splitter = QSplitter(Qt.Horizontal)
+   158→   158→        root.addWidget(splitter, stretch=1)
+   159→   159→
+   160→   160→        # ----- LEFT: tuner + controls -----
+   161→   161→        left = QWidget()
+   162→   162→        left_layout = QVBoxLayout(left)
+   163→   163→
+   164→   164→        # Frequency dial
+   165→   165→        self.dial = FrequencyDial()
+   166→   166→        self.dial.tune_requested.connect(self._tune_to)
+   167→   167→        left_layout.addWidget(self.dial)
+   168→   168→
+   169→   169→        # Modulation + gain + squelch
+   170→   170→        ctrl_box = QGroupBox("Receiver")
+   171→   171→        ctrl_layout = QFormLayout(ctrl_box)
+   172→   172→        self.mod_combo = QComboBox()
+   173→   173→        self.mod_combo.addItems(MODULATIONS)
+   174→   174→        self.mod_combo.currentTextChanged.connect(self._on_modulation_changed)
+   175→   175→        ctrl_layout.addRow("Modulation:", self.mod_combo)
+   176→   176→
+   177→   177→        self.gain_spin = QDoubleSpinBox()
+   178→   178→        self.gain_spin.setRange(0, 49.6)
+   179→   179→        self.gain_spin.setSingleStep(0.1)
+   180→   180→        self.gain_spin.setSuffix(" dB")
+   181→   181→        self.gain_spin.setValue(self.config.gain_db)
+   182→   182→        self.gain_spin.valueChanged.connect(self._on_gain_changed)
+   183→   183→        ctrl_layout.addRow("RF Gain:", self.gain_spin)
+   184→   184→
+   185→   185→        self.sql_spin = QDoubleSpinBox()
+   186→   186→        self.sql_spin.setRange(-150, 0)
+   187→   187→        self.sql_spin.setSingleStep(1.0)
+   188→   188→        self.sql_spin.setValue(-150)
+   189→   189→        self.sql_spin.setSuffix(" dB")
+   190→   190→        self.sql_spin.valueChanged.connect(self._on_squelch_changed)
+   191→   191→        ctrl_layout.addRow("Squelch:", self.sql_spin)
+   192→   192→
+   193→   193→        # Volume + mute
+   194→   194→        vol_row = QHBoxLayout()
+   195→   195→        self.vol_slider = QSlider(Qt.Horizontal)
+   196→   196→        self.vol_slider.setRange(0, 100)
+   197→   197→        self.vol_slider.setValue(int(self.config.volume * 100))
+   198→   198→        self.vol_slider.valueChanged.connect(self._on_volume_changed)
+   199→   199→        vol_row.addWidget(self.vol_slider, stretch=1)
+   200→   200→        self.mute_btn = QPushButton("🔊")
+   201→   201→        self.mute_btn.setFixedWidth(40)
+   202→   202→        self.mute_btn.setCheckable(True)
+   203→   203→        self.mute_btn.toggled.connect(self._on_mute_toggled)
+   204→   204→        vol_row.addWidget(self.mute_btn)
+   205→   205→        ctrl_layout.addRow("Volume:", vol_row)
+   206→   206→
+   207→   207→        # Signal level bar (using a QProgressBar as a meter)
+   208→   208→        self.signal_bar = QProgressBar()
+   209→   209→        self.signal_bar.setRange(-100, 0)
+   210→   210→        self.signal_bar.setFormat("%v dB")
+   211→   211→        self.signal_bar.setValue(-100)
+   212→   212→        ctrl_layout.addRow("Signal:", self.signal_bar)
+   213→   213→
+   214→   214→        left_layout.addWidget(ctrl_box)
+   215→   215→
+   216→   216→        # Recording controls
+   217→   217→        rec_box = QGroupBox("Recording")
+   218→   218→        rec_layout = QHBoxLayout(rec_box)
+   219→   219→        self.rec_btn = QPushButton("● Record")
+   220→   220→        self.rec_btn.setStyleSheet("QPushButton { color: #ff5c5c; font-weight: bold; padding: 8px; }"
+   221→   221→                                    "QPushButton:checked { background: #ff5c5c; color: white; }")
+   222→   222→        self.rec_btn.setCheckable(True)
+   223→   223→        self.rec_btn.toggled.connect(self._on_record_toggled)
+   224→   224→        rec_layout.addWidget(self.rec_btn)
+   225→   225→        self.rec_status = QLabel("Idle")
+   226→   226→        rec_layout.addWidget(self.rec_status)
+   227→   227→        left_layout.addWidget(rec_box)
+   228→   228→
+   229→   229→        # Connection controls
+   230→   230→        conn_box = QGroupBox("Gqrx Connection")
+   231→   231→        conn_layout = QHBoxLayout(conn_box)
+   232→   232→        self.conn_btn = QPushButton("Connect")
+   233→   233→        self.conn_btn.clicked.connect(self._on_connect_clicked)
+   234→   234→        conn_layout.addWidget(self.conn_btn)
+   235→   235→        self.conn_status = QLabel("Disconnected")
+   236→   236→        conn_layout.addWidget(self.conn_status)
+   237→   237→        left_layout.addWidget(conn_box)
+   238→   238→
+   239→   239→        # Web server toggle
+   240→   240→        web_box = QGroupBox("Remote Access")
+   241→   241→        web_layout = QHBoxLayout(web_box)
+   242→   242→        self.web_btn = QPushButton("Start Web Server")
+   243→   243→        self.web_btn.setCheckable(True)
+   244→   244→        self.web_btn.setChecked(self.config.remote_access_enabled)
+   245→   245→        self.web_btn.clicked.connect(self._on_web_toggled)
+   246→   246→        web_layout.addWidget(self.web_btn)
+   247→   247→        self.web_url = QLabel(f"http://0.0.0.0:{self.config.web_port}")
+   248→   248→        web_layout.addWidget(self.web_url)
+   249→   249→        left_layout.addWidget(web_box)
+   250→   250→
+   251→   251→        left_layout.addStretch(1)
+   252→   252→        splitter.addWidget(left)
+   253→   253→
+   254→   254→        # ----- RIGHT: waterfall + tabs -----
+   255→   255→        right = QWidget()
+   256→   256→        right_layout = QVBoxLayout(right)
+   257→   257→        right_layout.setContentsMargins(0, 0, 0, 0)
+   258→   258→
+   259→   259→        self.waterfall = WaterfallWidget()
+   260→   260→        self.waterfall.tune_requested.connect(self._tune_to)
+   261→   261→        right_layout.addWidget(self.waterfall, stretch=2)
+   262→   262→
+   263→   263→        self.tabs = QTabWidget()
+   264→   264→        right_layout.addWidget(self.tabs, stretch=1)
+   265→   265→
+   266→   266→        # Bookmarks tab
+   267→   267→        self.bookmark_list = QListWidget()
+   268→   268→        self.bookmark_list.itemDoubleClicked.connect(self._on_bookmark_activated)
+   269→   269→        self._refresh_bookmarks()
+   270→   270→        bm_widget = QWidget()
+   271→   271→        bm_layout = QVBoxLayout(bm_widget)
+   272→   272→        bm_search = QLineEdit()
+   273→   273→        bm_search.setPlaceholderText("Search bookmarks…")
+   274→   274→        bm_search.textChanged.connect(self._on_bookmark_search)
+   275→   275→        bm_layout.addWidget(bm_search)
+   276→   276→        bm_layout.addWidget(self.bookmark_list)
+   277→   277→        bm_add_row = QHBoxLayout()
+   278→   278→        self.bm_add_freq = QLineEdit()
+   279→   279→        self.bm_add_freq.setPlaceholderText("MHz")
+   280→   280→        self.bm_add_label = QLineEdit()
+   281→   281→        self.bm_add_label.setPlaceholderText("Label")
+   282→   282→        bm_add_btn = QPushButton("Add")
+   283→   283→        bm_add_btn.clicked.connect(self._on_add_bookmark)
+   284→   284→        bm_add_row.addWidget(self.bm_add_freq)
+   285→   285→        bm_add_row.addWidget(self.bm_add_label, stretch=1)
+   286→   286→        bm_add_row.addWidget(bm_add_btn)
+   287→   287→        bm_layout.addLayout(bm_add_row)
+   288→   288→        self.tabs.addTab(bm_widget, "Bookmarks")
+   289→   289→
+   290→   290→        # Scanner tab
+   291→   291→        scan_widget = QWidget()
+   292→   292→        scan_layout = QVBoxLayout(scan_widget)
+   293→   293→        scan_band_row = QHBoxLayout()
+   294→   294→        self.scan_band_combo = QComboBox()
+   295→   295→        self.scan_band_combo.addItems([b.name for b in BANDS] + ["ALL BANDS"])
+   296→   296→        scan_band_row.addWidget(self.scan_band_combo)
+   297→   297→        scan_start_btn = QPushButton("▶ Scan")
+   298→   298→        scan_start_btn.clicked.connect(self._on_scan_start)
+   299→   299→        scan_band_row.addWidget(scan_start_btn)
+   300→   300→        # New: Test sweep button — scans but reports EVERY frequency's level,
+   301→   301→        # regardless of threshold. Great for diagnosing "0 stations found".
+   302→   302→        test_sweep_btn = QPushButton("🔬 Test Sweep")
+   303→   303→        test_sweep_btn.setToolTip("Sweep the band and show signal level at every frequency, "
+   304→   304→                                  "regardless of threshold. Use this to diagnose if the scanner "
+   305→   305→                                  "is seeing any signal at all.")
+   306→   306→        test_sweep_btn.clicked.connect(self._on_test_sweep)
+   307→   307→        scan_band_row.addWidget(test_sweep_btn)
+   308→   308→        scan_stop_btn = QPushButton("■ Stop")
+   309→   309→        scan_stop_btn.clicked.connect(lambda: self.scanner.stop())
+   310→   310→        scan_band_row.addWidget(scan_stop_btn)
+   311→   311→        scan_layout.addLayout(scan_band_row)
+   312→   312→
+   313→   313→        # Live level readout — shows the current frequency being sampled and
+   314→   314→        # its signal level, so you can see what the scanner is "hearing".
+   315→   315→        self.scan_live_label = QLabel("Live: idle")
+   316→   316→        self.scan_live_label.setStyleSheet("color: #5cd9ff; font-family: monospace; padding: 2px;")
+   317→   317→        scan_layout.addWidget(self.scan_live_label)
+   318→   318→
+   319→   319→        self.scan_progress = QProgressBar()
+   320→   320→        scan_layout.addWidget(self.scan_progress)
+   321→   321→        self.scan_status = QLabel("Idle")
+   322→   322→        scan_layout.addWidget(self.scan_status)
+   323→   323→        self.discovered_list = QListWidget()
+   324→   324→        self.discovered_list.itemDoubleClicked.connect(self._on_discovered_activated)
+   325→   325→        scan_layout.addWidget(self.discovered_list, stretch=1)
+   326→   326→
+   327→   327→        # Test-sweep results list — shows every frequency's level
+   328→   328→        self.test_sweep_list = QListWidget()
+   329→   329→        self.test_sweep_list.itemDoubleClicked.connect(self._on_discovered_activated)
+   330→   330→        scan_layout.addWidget(QLabel("Test sweep results (all frequencies sampled):"))
+   331→   331→        scan_layout.addWidget(self.test_sweep_list, stretch=1)
+   332→   332→
+   333→   333→        self.tabs.addTab(scan_widget, "Auto-Discover")
+   334→   334→
+   335→   335→        # Recordings tab
+   336→   336→        rec_widget = QWidget()
+   337→   337→        rec_layout = QVBoxLayout(rec_widget)
+   338→   338→        rec_refresh = QPushButton("⟳ Refresh")
+   339→   339→        rec_refresh.clicked.connect(self._refresh_recordings)
+   340→   340→        rec_layout.addWidget(rec_refresh)
+   341→   341→        self.rec_list = QListWidget()
+   342→   342→        rec_layout.addWidget(self.rec_list, stretch=1)
+   343→   343→        self.tabs.addTab(rec_widget, "Recordings")
+   344→   344→
+   345→   345→        # Settings tab
+   346→   346→        set_widget = QWidget()
+   347→   347→        set_layout = QFormLayout(set_widget)
+   348→   348→        self.set_threshold = QDoubleSpinBox()
+   349→   349→        self.set_threshold.setRange(-120, 0)
+   350→   350→        self.set_threshold.setValue(self.config.scan_threshold_db)
+   351→   351→        self.set_threshold.setSuffix(" dB")
+   352→   352→        self.set_threshold.valueChanged.connect(self._on_settings_changed)
+   353→   353→        self.set_threshold.setToolTip(
+   354→   354→            "Signal level (in dBFS) above which a frequency is considered a station.\n\n"
+   355→   355→            "Gqrx reports dBFS, not dBm. Typical values:\n"
+   356→   356→            "  -30 to -50: very strong local FM\n"
+   357→   357→            "  -50 to -65: normal stations\n"
+   358→   358→            "  -65 to -80: weak but audible\n"
+   359→   359→            "  -80 to -120: noise floor\n\n"
+   360→   360→            "If 'Auto threshold' is on, this value is overridden by noise_floor + margin."
+   361→   361→        )
+   362→   362→        set_layout.addRow("Scan threshold:", self.set_threshold)
+   363→   363→
+   364→   364→        # Auto-threshold toggle — when on, scanner measures noise floor at the
+   365→   365→        # start of each scan and uses noise_floor + margin as the threshold.
+   366→   366→        # This is the fix for "0 stations found".
+   367→   367→        self.set_auto_threshold = QCheckBox("Auto-calibrate threshold from noise floor")
+   368→   368→        self.set_auto_threshold.setChecked(True)
+   369→   369→        self.set_auto_threshold.setToolTip(
+   370→   370→            "Before each scan, samples 10 frequencies across the band to measure the "
+   371→   371→            "local noise floor, then sets the threshold to noise_floor + margin.\n\n"
+   372→   372→            "Strongly recommended — fixes the common '0 stations found' issue when "
+   373→   373→            "the threshold doesn't match your antenna/gain conditions."
+   374→   374→        )
+   375→   375→        self.set_auto_threshold.toggled.connect(self._on_settings_changed)
+   376→   376→        set_layout.addRow(self.set_auto_threshold)
+   377→   377→
+   378→   378→        self.set_margin = QDoubleSpinBox()
+   379→   379→        self.set_margin.setRange(0, 40)
+   380→   380→        self.set_margin.setSingleStep(1.0)
+   381→   381→        self.set_margin.setValue(10.0)
+   382→   382→        self.set_margin.setSuffix(" dB")
+   383→   383→        self.set_margin.setToolTip("How many dB above the measured noise floor a signal must be to count as a station.")
+   384→   384→        self.set_margin.valueChanged.connect(self._on_settings_changed)
+   385→   385→        set_layout.addRow("Auto threshold margin:", self.set_margin)
+   386→   386→
+   387→   387→        self.set_dwell = QDoubleSpinBox()
+   388→   388→        self.set_dwell.setRange(0.05, 5.0)
+   389→   389→        self.set_dwell.setSingleStep(0.05)
+   390→   390→        self.set_dwell.setValue(self.config.scan_dwell_s)
+   391→   391→        self.set_dwell.setSuffix(" s")
+   392→   392→        self.set_dwell.valueChanged.connect(self._on_settings_changed)
+   393→   393→        set_layout.addRow("Scan dwell time:", self.set_dwell)
+   394→   394→        self.set_ai = QCheckBox("Enable AI tagging")
+   395→   395→        self.set_ai.setChecked(self.config.ai_tagging_enabled)
+   396→   396→        self.set_ai.toggled.connect(self._on_settings_changed)
+   397→   397→        set_layout.addRow(self.set_ai)
+   398→   398→        self.tabs.addTab(set_widget, "Settings")
+   399→   399→
+   400→   400→        splitter.addWidget(right)
+   401→   401→        splitter.setSizes([400, 800])
+   402→   402→
+   403→   403→        # Status bar
+   404→   404→        self.status = QStatusBar()
+   405→   405→        self.setStatusBar(self.status)
+   406→   406→        self.status.showMessage("Ready. Click 'Connect' to attach to Gqrx.")
+   407→   407→
+   408→   408→    # ----------------------------- signal wiring -----------------------------
+   409→   409→    def _wire_signals(self) -> None:
+   410→   410→        # Gqrx signals
+   411→   411→        self.gqrx.connected.connect(self._on_gqrx_connected)
+   412→   412→        self.gqrx.disconnected.connect(self._on_gqrx_disconnected)
+   413→   413→        self.gqrx.frequency_changed.connect(self._on_freq_changed)
+   414→   414→        self.gqrx.modulation_changed.connect(self._on_mod_changed)
+   415→   415→        self.gqrx.signal_level.connect(self._on_signal_level)
+   416→   416→        self.gqrx.error.connect(self._on_gqrx_error)
+   417→   417→
+   418→   418→        # Audio → player + recording
+   419→   419→        self.audio_receiver.chunk_ready.connect(self._on_audio_chunk)
+   420→   420→
+   421→   421→        # Spectrum → waterfall
+   422→   422→        self.spectrum_receiver.spectrum_ready.connect(
+   423→   423→            lambda data, c, s: self.waterfall.update_spectrum(data, c, s)
+   424→   424→        )
+   425→   425→
+   426→   426→        # Scanner
+   427→   427→        self.scanner.scan_started.connect(self._on_scan_started)
+   428→   428→        self.scanner.scan_progress.connect(self._on_scan_progress)
+   429→   429→        self.scanner.scan_progress_freq.connect(
+   430→   430→            lambda f: self.scan_status.setText(f"Scanning: {f/1e6:.4f} MHz")
+   431→   431→        )
+   432→   432→        # Live level readout — shows what the scanner is hearing in real time
+   433→   433→        self.scanner.scan_progress_level.connect(self._on_scan_progress_level)
+   434→   434→        self.scanner.station_found.connect(self._on_station_found)
+   435→   435→        self.scanner.scan_finished.connect(self._on_scan_finished)
+   436→   436→        self.scanner.scan_error.connect(self._on_scan_error)
+   437→   437→        self.scanner.noise_floor_calibrated.connect(self._on_noise_floor_calibrated)
+   438→   438→
+   439→   439→        # Recordings
+   440→   440→        self.recordings.recording_started.connect(self._on_recording_started)
+   441→   441→        self.recordings.recording_stopped.connect(self._on_recording_stopped)
+   442→   442→        self.recordings.chunk_recorded.connect(
+   443→   443→            lambda frames: self.rec_status.setText(f"● {frames / 48000:.1f}s")
+   444→   444→        )
+   445→   445→
+   446→   446→        # AI tagger
+   447→   447→        self.ai_tagger.tag_ready.connect(self._on_ai_tag_ready)
+   448→   448→        self.ai_tagger.tag_failed.connect(
+   449→   449→            lambda f, e: self.status.showMessage(f"AI tag failed for {f/1e6:.4f}: {e}", 3000)
+   450→   450→        )
+   451→   451→
+   452→   452→    def _apply_config(self) -> None:
+   453→   453→        self.dial.set_frequency(self.config.last_frequency_hz)
+   454→   454→        self.mod_combo.setCurrentText(self.config.last_modulation)
+   455→   455→        # Apply initial band context to waterfall
+   456→   456→        self._update_band_context(self.config.last_frequency_hz)
+   457→   457→        # Auto-start web server if enabled
+   458→   458→        if self.config.remote_access_enabled:
+   459→   459→            QTimer.singleShot(500, lambda: self.web_btn.click())
+   460→   460→
+   461→   461→    # ----------------------------- handlers -----------------------------
+   462→   462→    def _on_connect_clicked(self) -> None:
+   463→   463→        if self.gqrx.is_connected():
+   464→   464→            self.gqrx.disconnect()
+   465→   465→        else:
+   466→   466→            ok = self.gqrx.connect()
+   467→   467→            if not ok:
+   468→   468→                QMessageBox.warning(
+   469→   469→                    self, "Cannot connect to Gqrx",
+   470→   470→                    f"Could not connect to Gqrx at {self.config.gqrx_host}:{self.config.gqrx_port}.\n\n"
+   471→   471→                    "Make sure Gqrx is running and remote control is enabled:\n"
+   472→   472→                    "  Tools → Remote control settings → Enable remote control\n\n"
+   473→   473→                    "Also enable:\n"
+   474→   474→                    "  • Audio UDP stream (port 7355)\n"
+   475→   475→                    "  • Spectrum UDP stream (port 7357)"
+   476→   476→                )
+   477→   477→                return
+   478→   478→            # Start audio + spectrum receivers
+   479→   479→            self.audio_receiver.start()
+   480→   480→            self.spectrum_receiver.start()
+   481→   481→            # Restore state
+   482→   482→            self.gqrx.set_frequency(self.config.last_frequency_hz)
+   483→   483→            self.gqrx.set_modulation(self.config.last_modulation)
+   484→   484→            if self.config.gain_db > 0:
+   485→   485→                self.gqrx.set_rf_gain(self.config.gain_db)
+   486→   486→
+   487→   487→    def _on_gqrx_connected(self) -> None:
+   488→   488→        self.conn_btn.setText("Disconnect")
+   489→   489→        self.conn_status.setText("Connected")
+   490→   490→        self.conn_status.setStyleSheet("color: #5cffaa;")
+   491→   491→        self.status.showMessage("Connected to Gqrx.", 3000)
+   492→   492→
+   493→   493→    def _on_gqrx_disconnected(self, reason: str) -> None:
+   494→   494→        self.conn_btn.setText("Connect")
+   495→   495→        self.conn_status.setText("Disconnected")
+   496→   496→        self.conn_status.setStyleSheet("color: #ff5c5c;")
+   497→   497→        self.status.showMessage(f"Disconnected: {reason}", 5000)
+   498→   498→
+   499→   499→    def _on_gqrx_error(self, err: str) -> None:
+   500→   500→        self.status.showMessage(err, 5000)
+   501→   501→
+   502→   502→    def _on_freq_changed(self, freq_hz: int) -> None:
+   503→   503→        self.dial.set_frequency(freq_hz)
+   504→   504→        self.waterfall.set_tune_marker(freq_hz)
+   505→   505→        self._update_band_context(freq_hz)
+   506→   506→        self.config.last_frequency_hz = freq_hz
+   507→   507→        self.bookmarks.update_last_heard(freq_hz)
+   508→   508→        self.config.save()
+   509→   509→
+   510→   510→    def _on_mod_changed(self, mod: str) -> None:
+   511→   511→        self.mod_combo.blockSignals(True)
+   512→   512→        self.mod_combo.setCurrentText(mod)
+   513→   513→        self.mod_combo.blockSignals(False)
+   514→   514→        self.config.last_modulation = mod
+   515→   515→
+   516→   516→    def _on_signal_level(self, lvl: float) -> None:
+   517→   517→        self.signal_bar.setValue(int(lvl))
+   518→   518→        # Also feed the recording manager
+   519→   519→        if self.recordings.is_recording:
+   520→   520→            # will be picked up on next audio chunk
+   521→   521→            pass
+   522→   522→
+   523→   523→    def _on_audio_chunk(self, chunk: np.ndarray, sample_rate: int, channels: int) -> None:
+   524→   524→        # Playback
+   525→   525→        self.audio_player.push(chunk)
+   526→   526→        # Recording
+   527→   527→        if self.recordings.is_recording:
+   528→   528→            lvl = self.gqrx.get_signal_level() or -120.0
+   529→   529→            self.recordings.write_chunk(chunk, sample_rate, channels, signal_level_db=lvl)
+   530→   530→
+   531→   531→    def _tune_to(self, freq_hz: int) -> None:
+   532→   532→        if not self.gqrx.is_connected():
+   533→   533→            self.status.showMessage("Not connected to Gqrx", 2000)
+   534→   534→            return
+   535→   535→        b = band_for_frequency(freq_hz)
+   536→   536→        mod = b.modulation if b else "FM"
+   537→   537→        if self.mod_combo.currentText() != mod:
+   538→   538→            self.gqrx.set_modulation(mod)
+   539→   539→        self.gqrx.set_frequency(freq_hz)
+   540→   540→
+   541→   541→    def _on_modulation_changed(self, mod: str) -> None:
+   542→   542→        if self.gqrx.is_connected():
+   543→   543→            self.gqrx.set_modulation(mod)
+   544→   544→        self.config.last_modulation = mod
+   545→   545→
+   546→   546→    def _on_gain_changed(self, gain: float) -> None:
+   547→   547→        if self.gqrx.is_connected():
+   548→   548→            self.gqrx.set_rf_gain(gain)
+   549→   549→        self.config.gain_db = gain
+   550→   550→
+   551→   551→    def _on_squelch_changed(self, sql: float) -> None:
+   552→   552→        if self.gqrx.is_connected():
+   553→   553→            self.gqrx.set_squelch(sql)
+   554→   554→
+   555→   555→    def _on_volume_changed(self, v: int) -> None:
+   556→   556→        vol = v / 100.0
+   557→   557→        self.audio_player.set_volume(vol)
+   558→   558→        self.config.volume = vol
+   559→   559→
+   560→   560→    def _on_mute_toggled(self, muted: bool) -> None:
+   561→   561→        self.audio_player.set_muted(muted)
+   562→   562→        self.mute_btn.setText("🔇" if muted else "🔊")
+   563→   563→
+   564→   564→    def _on_record_toggled(self, on: bool) -> None:
+   565→   565→        if on:
+   566→   566→            freq = self.config.last_frequency_hz
+   567→   567→            mod = self.config.last_modulation
+   568→   568→            label = lookup_known(freq) or self.bookmarks.get(freq).label if self.bookmarks.get(freq) else None
+   569→   569→            ok = self.recordings.start_recording(freq, mod, label=label)
+   570→   570→            if not ok:
+   571→   571→                self.rec_btn.setChecked(False)
+   572→   572→        else:
+   573→   573→            self.recordings.stop_recording()
+   574→   574→
+   575→   575→    def _on_recording_started(self, r) -> None:
+   576→   576→        self.rec_btn.setText("■ Stop")
+   577→   577→        self.rec_status.setText("● Recording…")
+   578→   578→        self.status.showMessage(f"Recording → {r.wav_path}", 3000)
+   579→   579→
+   580→   580→    def _on_recording_stopped(self, r, path: str) -> None:
+   581→   581→        self.rec_btn.setText("● Record")
+   582→   582→        self.rec_btn.setChecked(False)
+   583→   583→        self.rec_status.setText(f"Saved: {path.split('/')[-1]}")
+   584→   584→        self.status.showMessage(f"Recording saved: {path}", 5000)
+   585→   585→        self._refresh_recordings()
+   586→   586→
+   587→   587→    # ----------------------------- web server -----------------------------
+   588→   588→    def _on_web_toggled(self) -> None:
+   589→   589→        if self.web_btn.isChecked():
+   590→   590→            self._start_web_server()
+   591→   591→        else:
+   592→   592→            self._stop_web_server()
+   593→   593→
+   594→   594→    def _start_web_server(self) -> None:
+   595→   595→        if self.web_server is not None:
+   596→   596→            return
+   597→   597→        host = "0.0.0.0" if self.config.allow_remote_connections else "127.0.0.1"
+   598→   598→        self.web_server = WebServer(
+   599→   599→            app_factory_args=dict(
+   600→   600→                gqrx=self.gqrx,
+   601→   601→                bookmarks=self.bookmarks,
+   602→   602→                recordings=self.recordings,
+   603→   603→                scanner=self.scanner,
+   604→   604→                ai_tagger=self.ai_tagger,
+   605→   605→                audio_receiver=self.audio_receiver,
+   606→   606→                spectrum_receiver=self.spectrum_receiver,
+   607→   607→                get_state_fn=self._get_state,
+   608→   608→            ),
+   609→   609→            host=host,
+   610→   610→            port=self.config.web_port,
+   611→   611→        )
+   612→   612→        if self.web_server.start():
+   613→   613→            self.web_btn.setText("Stop Web Server")
+   614→   614→            self.web_url.setText(f"http://{host}:{self.config.web_port}")
+   615→   615→            self.status.showMessage(f"Remote access: http://{host}:{self.config.web_port}", 5000)
+   616→   616→        else:
+   617→   617→            self.web_server = None
+   618→   618→            self.web_btn.setChecked(False)
+   619→   619→
+   620→   620→    def _stop_web_server(self) -> None:
+   621→   621→        if self.web_server:
+   622→   622→            self.web_server.stop()
+   623→   623→            self.web_server = None
+   624→   624→        self.web_btn.setText("Start Web Server")
+   625→   625→
+   626→   626→    def _get_state(self) -> dict:
+   627→   627→        label = None
+   628→   628→        b = self.bookmarks.get(self.config.last_frequency_hz)
+   629→   629→        if b:
+   630→   630→            label = b.label
+   631→   631→        else:
+   632→   632→            label = lookup_known(self.config.last_frequency_hz)
+   633→   633→        band = band_for_frequency(self.config.last_frequency_hz)
+   634→   634→        return {
+   635→   635→            "freq_hz": self.config.last_frequency_hz,
+   636→   636→            "modulation": self.config.last_modulation,
+   637→   637→            "signal_level_db": self.signal_bar.value(),
+   638→   638→            "is_recording": self.recordings.is_recording,
+   639→   639→            "gqrx_connected": self.gqrx.is_connected(),
+   640→   640→            "label": label,
+   641→   641→            "band": band.name if band else "Custom",
+   642→   642→            "volume": self.audio_player.get_volume(),
+   643→   643→            "muted": self.audio_player.is_muted(),
+   644→   644→        }
+   645→   645→
+   646→   646→    # ----------------------------- waterfall context -----------------------------
+   647→   647→    def _update_band_context(self, freq_hz: int) -> None:
+   648→   648→        # Set spectrum span based on band
+   649→   649→        b = band_for_frequency(freq_hz)
+   650→   650→        if b:
+   651→   651→            span = min(int((b.end_mhz - b.start_mhz) * 1e6), 2_400_000)
+   652→   652→            span = max(span, 200_000)
+   653→   653→        else:
+   654→   654→            span = 2_000_000
+   655→   655→        self.waterfall.set_band_context(freq_hz, span)
+   656→   656→        self.spectrum_receiver.set_band_context(freq_hz, span)
+   657→   657→
+   658→   658→    # ----------------------------- bookmarks -----------------------------
+   659→   659→    def _refresh_bookmarks(self, query: str = "") -> None:
+   660→   660→        self.bookmark_list.clear()
+   661→   661→        items = self.bookmarks.search(query) if query else self.bookmarks.list_all()
+   662→   662→        for b in items:
+   663→   663→            text = f"{b.freq_hz/1e6:.4f} MHz · {b.label} [{b.band}]"
+   664→   664→            if b.ai_tag:
+   665→   665→                text += f"  AI: {b.ai_tag}"
+   666→   666→            item = QListWidgetItem(text)
+   667→   667→            item.setData(Qt.UserRole, b.freq_hz)
+   668→   668→            self.bookmark_list.addItem(item)
+   669→   669→
+   670→   670→    def _on_bookmark_search(self, text: str) -> None:
+   671→   671→        self._refresh_bookmarks(text)
+   672→   672→
+   673→   673→    def _on_bookmark_activated(self, item) -> None:
+   674→   674→        freq = item.data(Qt.UserRole)
+   675→   675→        self._tune_to(int(freq))
+   676→   676→
+   677→   677→    def _on_add_bookmark(self) -> None:
+   678→   678→        try:
+   679→   679→            mhz = float(self.bm_add_freq.text())
+   680→   680→        except ValueError:
+   681→   681→            self.status.showMessage("Invalid frequency", 2000)
+   682→   682→            return
+   683→   683→        label = self.bm_add_label.text() or None
+   684→   684→        b = self.bookmarks.add(freq_hz=int(mhz * 1e6), label=label)
+   685→   685→        self.bm_add_freq.clear()
+   686→   686→        self.bm_add_label.clear()
+   687→   687→        self._refresh_bookmarks()
+   688→   688→        self.status.showMessage(f"Added bookmark: {b.label}", 2000)
+   689→   689→
+   690→   690→    # ----------------------------- scanner -----------------------------
+   691→   691→    def _on_scan_start(self) -> None:
+   692→   692→        band_name = self.scan_band_combo.currentText()
+   693→   693→        # Clear test-sweep results when starting a real scan
+   694→   694→        self.test_sweep_list.clear()
+   695→   695→        if band_name == "ALL BANDS":
+   696→   696→            self.scanner.scan_all_bands()
+   697→   697→        else:
+   698→   698→            self.scanner.scan_band_by_name(band_name)
+   699→   699→
+   700→   700→    def _on_test_sweep(self) -> None:
+   701→   701→        """Diagnostic sweep: samples every frequency and shows ALL levels,
+   702→   702→        regardless of threshold. Use this to figure out why 'Scan' returns 0.
+   703→   703→        """
+   704→   704→        if not self.gqrx.is_connected():
+   705→   705→            QMessageBox.warning(self, "Not connected",
+   706→   706→                                "Connect to Gqrx first, then run Test Sweep.")
+   707→   707→            return
+   708→   708→        if self.scanner.is_running():
+   709→   709→            self.scanner.stop()
+   710→   710→            return
+   711→   711→        band_name = self.scan_band_combo.currentText()
+   712→   712→        if band_name == "ALL BANDS":
+   713→   713→            band_name = "FM Broadcast"  # test sweep is single-band only
+   714→   714→        band = BANDS_BY_NAME.get(band_name)
+   715→   715→        if not band:
+   716→   716→            return
+   717→   717→        # Run in a thread so the UI stays responsive
+   718→   718→        import threading
+   719→   719→        self.test_sweep_list.clear()
+   720→   720→        self.scan_status.setText(f"Test sweeping {band.name}…")
+   721→   721→        self.scan_progress.setValue(0)
+   722→   722→
+   723→   723→        def sweep():
+   724→   724→            start_hz = int(band.start_mhz * 1e6)
+   725→   725→            end_hz = int(band.end_mhz * 1e6)
+   726→   726→            step_hz = int(band.step_khz * 1e3)
+   727→   727→            n_steps = max(1, (end_hz - start_hz) // step_hz + 1)
+   728→   728→            self.gqrx.set_modulation(band.modulation)
+   729→   729→            time.sleep(0.1)
+   730→   730→            results = []
+   731→   731→            for i, f in enumerate(range(start_hz, end_hz + 1, step_hz)):
+   732→   732→                if self.scanner._stop.is_set():
+   733→   733→                    break
+   734→   734→                self.gqrx.set_frequency(f)
+   735→   735→                time.sleep(self.scanner.dwell_s)
+   736→   736→                lvl = self.gqrx.get_signal_level()
+   737→   737→                if lvl is None:
+   738→   738→                    continue
+   739→   739→                results.append((f, lvl))
+   740→   740→                # Update progress UI (thread-safe via QMetaObject)
+   741→   741→                from PyQt5.QtCore import QMetaObject, Qt as QQt, Q_ARG
+   742→   742→                # Sort results and show top 50 strongest
+   743→   743→                results.sort(key=lambda x: x[1], reverse=True)
+   744→   744→                top = results[:50]
+   745→   745→                QMetaObject.invokeMethod(self, "_refresh_test_sweep",
+   746→   746→                                          QQt.QueuedConnection,
+   747→   747→                                          Q_ARG(list, top))
+   748→   748→                self.scan_progress.setValue(int((i + 1) / n_steps * 100))
+   749→   749→            self.scan_status.setText(
+   750→   750→                f"Test sweep done — {len(results)} freqs sampled. "
+   751→   751→                f"Strongest: {results[0][0]/1e6:.4f} MHz @ {results[0][1]:.1f} dBFS"
+   752→   752→                if results else "Test sweep done — no signal sampled (check antenna + gain)"
+   753→   753→            )
+   754→   754→
+   755→   755→        threading.Thread(target=sweep, daemon=True, name="TestSweep").start()
+   756→   756→
+   757→   757→    # Slot invoked from the sweep thread to update the test-sweep list
+   758→   758→    from PyQt5.QtCore import pyqtSlot
+   759→   759→    @pyqtSlot(list)
+   760→   760→    def _refresh_test_sweep(self, top_results: list) -> None:
+   761→   761→        self.test_sweep_list.clear()
+   762→   762→        for f, lvl in top_results:
+   763→   763→            # Color-code: green for strong, yellow for medium, dim for weak
+   764→   764→            if lvl > -50:
+   765→   765→                color = "#5cffaa"
+   766→   766→                tag = "STRONG"
+   767→   767→            elif lvl > -65:
+   768→   768→                color = "#ffd45c"
+   769→   769→                tag = "medium"
+   770→   770→            elif lvl > -80:
+   771→   771→                color = "#8b96a7"
+   772→   772→                tag = "weak"
+   773→   773→            else:
+   774→   774→                color = "#4a5266"
+   775→   775→                tag = "noise"
+   776→   776→            item = QListWidgetItem(f"{f/1e6:.4f} MHz · {lvl:.1f} dBFS · {tag}")
+   777→   777→            item.setForeground(QColor(color))
+   778→   778→            item.setData(Qt.UserRole, f)
+   779→   779→            self.test_sweep_list.addItem(item)
+   780→   780→
+   781→   781→    def _on_scan_started(self, band_name: str) -> None:
+   782→   782→        self.scan_status.setText(f"Scanning {band_name}…")
+   783→   783→        self.discovered_list.clear()
+   784→   784→        self.scan_progress.setValue(0)
+   785→   785→
+   786→   786→    def _on_scan_progress(self, p: float) -> None:
+   787→   787→        self.scan_progress.setValue(int(p * 100))
+   788→   788→
+   789→   789→    def _on_scan_progress_level(self, freq_hz: int, level_db: float) -> None:
+   790→   790→        """Live update of what the scanner is currently hearing."""
+   791→   791→        self.scan_live_label.setText(
+   792→   792→            f"Live: {freq_hz/1e6:.4f} MHz → {level_db:.1f} dBFS  "
+   793→   793→            f"(threshold: {self.scanner.threshold_db:.0f} dBFS)"
+   794→   794→        )
+   795→   795→
+   796→   796→    def _on_noise_floor_calibrated(self, nf: float) -> None:
+   797→   797→        self.scan_live_label.setText(
+   798→   798→            f"Noise floor calibrated: {nf:.1f} dBFS → threshold = {nf + self.scanner.auto_threshold_margin_db:.1f} dBFS"
+   799→   799→        )
+   800→   800→        self.status.showMessage(
+   801→   801→            f"Noise floor: {nf:.1f} dBFS; threshold set to {nf + self.scanner.auto_threshold_margin_db:.1f} dBFS",
+   802→   802→            4000
+   803→   803→        )
+   804→   804→
+   805→   805→    def _on_station_found(self, st: DiscoveredStation) -> None:
+   806→   806→        text = f"{st.freq_hz/1e6:.4f} MHz · {st.level_db:.1f} dB · {st.label or 'Unknown'}"
+   807→   807→        if st.ai_tag:
+   808→   808→            text += f"  [AI: {st.ai_tag.get('signal_type')}]"
+   809→   809→        item = QListWidgetItem(text)
+   810→   810→        item.setData(Qt.UserRole, st.freq_hz)
+   811→   811→        self.discovered_list.addItem(item)
+   812→   812→        # Auto-add to bookmarks if not present
+   813→   813→        if not self.bookmarks.get(st.freq_hz):
+   814→   814→            self.bookmarks.add(freq_hz=st.freq_hz, label=st.label or f"{st.freq_hz/1e6:.4f} MHz",
+   815→   815→                                modulation=st.modulation, ai_tag=st.ai_tag.get("summary") if st.ai_tag else None)
+   816→   816→        self._refresh_bookmarks()
+   817→   817→
+   818→   818→    def _on_scan_finished(self, band_name: str, found: list) -> None:
+   819→   819→        nf_str = ""
+   820→   820→        if self.scanner.measured_noise_floor is not None:
+   821→   821→            nf_str = f" (noise floor: {self.scanner.measured_noise_floor:.1f} dBFS)"
+   822→   822→        self.scan_status.setText(
+   823→   823→            f"Done — {len(found)} stations in {band_name}{nf_str}"
+   824→   824→        )
+   825→   825→        self.scan_progress.setValue(100)
+   826→   826→        if len(found) == 0:
+   827→   827→            self.scan_live_label.setText(
+   828→   828→                "0 stations found — try 🔬 Test Sweep to see all signal levels, "
+   829→   829→                "or check your antenna / Gqrx gain settings."
+   830→   830→            )
+   831→   831→
+   832→   832→    def _on_scan_error(self, err: str) -> None:
+   833→   833→        self.scan_status.setText(f"Error: {err}")
+   834→   834→
+   835→   835→    def _on_discovered_activated(self, item) -> None:
+   836→   836→        freq = item.data(Qt.UserRole)
+   837→   837→        self._tune_to(int(freq))
+   838→   838→
+   839→   839→    # ----------------------------- recordings -----------------------------
+   840→   840→    def _refresh_recordings(self) -> None:
+   841→   841→        self.rec_list.clear()
+   842→   842→        for r in self.recordings.list_recordings()[:50]:
+   843→   843→            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r.get("start_ts", 0)))
+   844→   844→            text = (f"{ts} · {r.get('freq_mhz', 0):.4f} MHz · {r.get('modulation', '')} · "
+   845→   845→                    f"{r.get('duration_s', 0):.1f}s · {r.get('label', '')}")
+   846→   846→            if r.get("ai_tag"):
+   847→   847→                text += f"  [AI: {r['ai_tag']}]"
+   848→   848→            item = QListWidgetItem(text)
+   849→   849→            item.setData(Qt.UserRole, r.get("path"))
+   850→   850→            self.rec_list.addItem(item)
+   851→   851→
+   852→   852→    # ----------------------------- AI -----------------------------
+   853→   853→    def _on_ai_tag_ready(self, freq_hz: int, tag) -> None:
+   854→   854→        # Update bookmark if exists
+   855→   855→        if self.bookmarks.get(freq_hz):
+   856→   856→            self.bookmarks.add(freq_hz=freq_hz,
+   857→   857→                                ai_tag=tag.get("summary") or tag.get("signal_type"))
+   858→   858→            self._refresh_bookmarks()
+   859→   859→        self.status.showMessage(
+   860→   860→            f"AI tagged {freq_hz/1e6:.4f} MHz: {tag.get('signal_type')} — {tag.get('summary', '')}",
+   861→   861→            5000
+   862→   862→        )
+   863→   863→
+   864→   864→    # ----------------------------- settings -----------------------------
+   865→   865→    def _on_settings_changed(self) -> None:
+   866→   866→        self.config.scan_threshold_db = self.set_threshold.value()
+   867→   867→        self.config.scan_dwell_s = self.set_dwell.value()
+   868→   868→        self.scanner.threshold_db = self.config.scan_threshold_db
+   869→   869→        self.scanner.dwell_s = self.config.scan_dwell_s
+   870→   870→        # Auto-threshold settings (the fix for "0 stations found")
+   871→   871→        self.scanner.auto_threshold = self.set_auto_threshold.isChecked()
+   872→   872→        self.scanner.auto_threshold_margin_db = self.set_margin.value()
+   873→   873→        self.config.ai_tagging_enabled = self.set_ai.isChecked()
+   874→   874→        self.ai_tagger.enabled = self.config.ai_tagging_enabled
+   875→   875→        self.scanner.ai_tagger = self.ai_tagger if self.ai_tagger.enabled else None
+   876→   876→        self.config.save()
+   877→   877→
+   878→   878→    # ----------------------------- periodic -----------------------------
+   879→   879→    def _update_status(self) -> None:
+   880→   880→        # Update status bar
+   881→   881→        if self.gqrx.is_connected():
+   882→   882→            f = self.config.last_frequency_hz
+   883→   883→            b = band_for_frequency(f)
+   884→   884→            self.status.showMessage(
+   885→   885→                f"Gqrx connected · {f/1e6:.4f} MHz · {self.config.last_modulation} · "
+   886→   886→                f"{b.name if b else 'Custom'} · {self.signal_bar.value()} dB"
+   887→   887→            )
+   888→   888→
+   889→   889→    # ----------------------------- shutdown -----------------------------
+   890→   890→    def closeEvent(self, event) -> None:
+   891→   891→        try:
+   892→   892→            self.config.window_width = self.width()
+   893→   893→            self.config.window_height = self.height()
+   894→   894→            self.config.save()
+   895→   895→        except Exception:
+   896→   896→            pass
+   897→   897→        try:
+   898→   898→            if self.web_server:
+   899→   899→                self.web_server.stop()
+   900→   900→        except Exception:
+   901→   901→            pass
+   902→   902→        try:
+   903→   903→            self.audio_receiver.stop()
+   904→   904→        except Exception:
+   905→   905→            pass
+   906→   906→        try:
+   907→   907→            self.spectrum_receiver.stop()
+   908→   908→        except Exception:
+   909→   909→            pass
+   910→   910→        try:
+   911→   911→            self.audio_player.stop()
+   912→   912→        except Exception:
+   913→   913→            pass
+   914→   914→        try:
+   915→   915→            self.gqrx.disconnect()
+   916→   916→        except Exception:
+   917→   917→            pass
+   918→   918→        super().closeEvent(event)
+   919→   919→

@@ -52,6 +52,11 @@ class AudioReceiver(QObject):
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._running = False
+        # UDP health tracking — used by the UI to detect if Gqrx is actually
+        # streaming audio. If packet_count stays 0 (or last_packet_age_s gets
+        # large), the user has NOT enabled the UDP audio stream in Gqrx.
+        self._packet_count: int = 0
+        self._last_packet_time: float = 0.0
 
     def start(self) -> bool:
         if self._running:
@@ -65,6 +70,8 @@ class AudioReceiver(QObject):
             self._sock.settimeout(0.5)
             self._stop.clear()
             self._running = True
+            self._packet_count = 0
+            self._last_packet_time = 0.0
             self._thread = threading.Thread(target=self._loop, daemon=True,
                                             name=f"AudioRecv:{self.port}")
             self._thread.start()
@@ -91,6 +98,23 @@ class AudioReceiver(QObject):
     def is_running(self) -> bool:
         return self._running
 
+    # ---- UDP health-check API (used by MainWindow to detect dead streams) ----
+    def packet_count(self) -> int:
+        """Total UDP audio packets received since start."""
+        return self._packet_count
+
+    def last_packet_age_s(self) -> Optional[float]:
+        """Seconds since the last packet arrived, or None if no packets yet."""
+        if self._last_packet_time == 0.0:
+            return None
+        return time.time() - self._last_packet_time
+
+    def is_streaming(self, max_age_s: float = 2.0) -> bool:
+        """True iff at least one packet arrived in the last `max_age_s` seconds."""
+        if self._last_packet_time == 0.0:
+            return False
+        return (time.time() - self._last_packet_time) <= max_age_s
+
     def _loop(self) -> None:
         bytes_per_sample = 2  # int16
         frame_size = bytes_per_sample * self.channels
@@ -103,6 +127,9 @@ class AudioReceiver(QObject):
                 break
             if not data:
                 continue
+            # Track packet arrival for health-check
+            self._packet_count += 1
+            self._last_packet_time = time.time()
             # Trim to whole frames
             n_full = (len(data) // frame_size) * frame_size
             if n_full == 0:

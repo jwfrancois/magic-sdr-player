@@ -53,6 +53,9 @@ class SpectrumReceiver(QObject):
         # Default band context (updated by main window when freq changes)
         self.center_hz: int = 96_900_000
         self.span_hz: int = 2_000_000  # Gqrx default FFT width ~2 MHz
+        # UDP health tracking — used by UI to detect if Gqrx is streaming spectrum.
+        self._packet_count: int = 0
+        self._last_packet_time: float = 0.0
 
     def start(self) -> bool:
         if self._running:
@@ -65,6 +68,8 @@ class SpectrumReceiver(QObject):
             self._sock.settimeout(0.5)
             self._stop.clear()
             self._running = True
+            self._packet_count = 0
+            self._last_packet_time = 0.0
             self._thread = threading.Thread(target=self._loop, daemon=True,
                                             name=f"SpectrumRecv:{self.port}")
             self._thread.start()
@@ -91,6 +96,20 @@ class SpectrumReceiver(QObject):
     def is_running(self) -> bool:
         return self._running
 
+    # ---- UDP health-check API ----
+    def packet_count(self) -> int:
+        return self._packet_count
+
+    def last_packet_age_s(self):
+        if self._last_packet_time == 0.0:
+            return None
+        return time.time() - self._last_packet_time
+
+    def is_streaming(self, max_age_s: float = 2.0) -> bool:
+        if self._last_packet_time == 0.0:
+            return False
+        return (time.time() - self._last_packet_time) <= max_age_s
+
     def set_band_context(self, center_hz: int, span_hz: int) -> None:
         """Inform the receiver of the current RF center/span so we can label
         the spectrum correctly. Gqrx's spectrum stream itself does not include
@@ -109,6 +128,9 @@ class SpectrumReceiver(QObject):
                 break
             if not data:
                 continue
+            # Track packet arrival
+            self._packet_count += 1
+            self._last_packet_time = time.time()
             # Gqrx spectrum stream = float32 little-endian magnitude (dBFS)
             n = len(data) // 4
             if n == 0:

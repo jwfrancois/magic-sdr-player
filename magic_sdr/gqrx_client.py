@@ -137,6 +137,25 @@ class GqrxClient(QObject):
     def is_connected(self) -> bool:
         return self._connected
 
+    # ---- poller control ----
+    # The background poller sends f/m/l STRENGTH commands every 500ms on the
+    # SAME socket the scanner uses. During a scan, this can interleave with
+    # the scanner's F/l STRENGTH commands and corrupt response parsing.
+    # The scanner calls pause_poller() before scanning and resume_poller()
+    # after, so it has exclusive access to the socket during sweeps.
+    def pause_poller(self) -> None:
+        """Temporarily stop the background poller (e.g., during scans)."""
+        if self._poller and self._poller.is_alive():
+            self._stop_poller.set()
+            self._poller.join(timeout=1.0)
+            self._poller = None
+
+    def resume_poller(self) -> None:
+        """Restart the background poller after a pause_poller() call."""
+        if not self._poller or not self._poller.is_alive():
+            self._stop_poller.clear()
+            self._start_poller()
+
     # ----------------------------- low-level I/O -----------------------------
     def _send(self, cmd: str, expect_reply: bool = True, timeout: float = 3.0) -> Optional[str]:
         """Send a single command and return the reply line (or None).
@@ -213,14 +232,56 @@ class GqrxClient(QObject):
         return r is not None and r.startswith("RPRT 0")
 
     def get_signal_level(self) -> Optional[float]:
-        """Read the current signal level in dB (smeter)."""
+        """Read the current signal level in dBFS via `l STRENGTH`.
+
+        Gqrx returns the dBFS value as a single line, e.g. "-72.34".
+        However, behavior varies across versions:
+          * Some return "RPRT 0" with no number (level not available)
+          * Some return an empty line
+          * Some return "0" (no signal at all)
+          * Some return a float, optionally followed by "RPRT 0" on the next line
+
+        We try to extract the first parseable float from the response.
+        Returns None if no number can be parsed (caller should treat as
+        "unknown" — NOT as a -100 dB signal).
+        """
+        import math
         r = self._send("l STRENGTH")
         if r is None:
             return None
-        try:
-            return float(r.split()[0])
-        except (ValueError, IndexError):
-            return None
+        # Multi-line: take the first line that parses as a float
+        for line in r.splitlines():
+            line = line.strip()
+            if not line or line.startswith("RPRT"):
+                continue
+            try:
+                v = float(line)
+            except ValueError:
+                # Maybe first token is the number
+                try:
+                    v = float(line.split()[0])
+                except (ValueError, IndexError):
+                    continue
+            # Reject NaN / Inf — Gqrx shouldn't send these but be defensive
+            if math.isfinite(v):
+                return v
+        return None
+
+    def get_signal_level_robust(self, n_samples: int = 3,
+                                 interval_s: float = 0.05) -> Optional[float]:
+        """Sample the signal level `n_samples` times and return the max.
+
+        Useful for scanning — a single sample can hit a fade, but the max
+        of several is a more reliable indicator of carrier presence.
+        """
+        best: Optional[float] = None
+        for _ in range(max(1, n_samples)):
+            lvl = self.get_signal_level()
+            if lvl is not None and (best is None or lvl > best):
+                best = lvl
+            if n_samples > 1:
+                time.sleep(interval_s)
+        return best
 
     def start_recording(self) -> bool:
         r = self._send("AOS")
