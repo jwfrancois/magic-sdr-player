@@ -453,3 +453,25 @@ Stage Summary:
 - All state persists across restarts (EQ gains + preset, visualizer mode,
   memory presets, CW/DX enable flags, night vision, observer latitude).
 - 201 tests passing across 4 test suites.
+
+---
+Task ID: github-push
+Agent: main
+Task: Push Magic SDR code to GitHub using user-provided credentials (jwfrancois / PAT)
+
+Work Log:
+- Reviewed project state and existing git history (13 commits on main, no remote configured)
+- Audited .env (only local SQLite path, no real secrets) and config.json (user preferences only) — safe to push config.json, but .env untracked by convention
+- Expanded .gitignore: added Python bytecode, venv, local DBs (*.db/*.sqlite), recordings/, IDE/OS files, tool-results/, upload/, secrets
+- Untracked .env from git index (file remains locally)
+- Created new public GitHub repo "magic-sdr-player" via API (POST /user/repos) with description
+- Added authenticated remote using PAT, pushed main branch with -u
+- Verified: 404 on .env contents URL (correctly excluded), all expected top-level files/dirs present on remote
+- Removed PAT from remote URL after push (security hygiene) — remote now uses clean HTTPS URL
+
+Stage Summary:
+- Repository URL: https://github.com/jwfrancois/magic-sdr-player
+- Branch: main (13 commits, tracks origin/main)
+- Visibility: public
+- .env excluded from VCS; all source code (magic_sdr/), scripts/, web/, docs, bookmarks, config pushed
+- Remote URL sanitized to remove embedded token
