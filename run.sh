@@ -8,16 +8,24 @@
 set -e
 cd "$(dirname "$0")"
 
-# Pick the right Python: honor $PYTHON if set, else use python3.
-PY="${PYTHON:-python3}"
-if [ ! -x "$(command -v "$PY")" ]; then
-    echo "Python 3 not found. Install python3 and try again."
-    exit 1
-fi
+# Pick the Python interpreter, in order of preference:
+#   1. $PYTHON if explicitly set
+#   2. The project's .venv created by setup.sh
+#   3. An active virtualenv ($VIRTUAL_ENV)
+#   4. System python3 as last resort
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# If a virtualenv is active, prefer it over $PYTHON
-if [ -n "$VIRTUAL_ENV" ] && [ -x "$VIRTUAL_ENV/bin/python3" ]; then
+if [ -n "$PYTHON" ] && [ -x "$(command -v "$PYTHON")" ]; then
+    PY="$PYTHON"
+elif [ -x "$SCRIPT_DIR/.venv/bin/python3" ]; then
+    PY="$SCRIPT_DIR/.venv/bin/python3"
+elif [ -n "$VIRTUAL_ENV" ] && [ -x "$VIRTUAL_ENV/bin/python3" ]; then
     PY="$VIRTUAL_ENV/bin/python3"
+elif command -v python3 >/dev/null; then
+    PY="python3"
+else
+    echo "Python 3 not found. Run ./setup.sh first, or install python3."
+    exit 1
 fi
 
 # Quick health-check: is Gqrx running?

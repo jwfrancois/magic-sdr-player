@@ -36,21 +36,23 @@ relative, so it's fully portable.
 ```
 
 This will:
-1. Install system packages via apt/dnf/pacman if missing: `gqrx`, `portaudio19-dev`, `rtl-sdr`, `nodejs`
+1. Install system packages via apt/dnf/pacman if missing: `gqrx`, `portaudio19-dev`, `rtl-sdr`, `nodejs`, `python3-venv`, `python3-pip`
 2. Install a udev rule so you can access the dongle as a non-root user (will prompt for sudo password)
-3. Install Python packages from `requirements.txt` (PyQt5, pyqtgraph, sounddevice, FastAPI, etc.)
-4. Install the `z-ai-web-dev-sdk` Node package for AI tagging
-5. Seed `bookmarks.json` with 88 default known channels
+3. **Create a project-local virtualenv at `.venv/`** — this sidesteps Debian/Ubuntu's PEP 668 "externally-managed-environment" protection so `pip install` just works without `--break-system-packages`
+4. Install Python packages from `requirements.txt` into the venv (PyQt5, pyqtgraph, sounddevice, FastAPI, etc.)
+5. Install the `z-ai-web-dev-sdk` Node package for AI tagging
+6. Seed `bookmarks.json` with 88 default known channels
 
-If you'd rather use a Python virtualenv, activate it before running setup:
+The script writes the chosen Python path to `.python-used` so `run.sh` can find it automatically next time.
+
+**If you prefer to use your own virtualenv** (e.g. conda, pyenv, or a manually created venv elsewhere), activate it first:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+source /path/to/your/venv/bin/activate
 ./setup.sh
 ```
 
-The setup script will detect the active virtualenv and install into it.
+The setup script will detect the active virtualenv via `$VIRTUAL_ENV` and install into it instead of creating a new one.
 
 ---
 
