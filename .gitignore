@@ -1,2 +1,50 @@
+# Skills (internal tooling)
 skills/
+
+# Node
 node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Local env / secrets
+.env
+.env.*
+*.secret
+*.key
+
+# Local DB / runtime artifacts
+db/
+*.db
+*.sqlite
+*.sqlite3
+recordings/
+*.wav
+*.mp3
+
+# Build / dist
+build/
+dist/
+*.spec
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Tooling output
+tool-results/
+upload/
+
+# Local config (keep template only)
+# config.json is committed for defaults; override locally
