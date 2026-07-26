@@ -426,6 +426,32 @@ class MainWindow(QMainWindow):
         self.set_ai.setChecked(self.config.ai_tagging_enabled)
         self.set_ai.toggled.connect(self._on_settings_changed)
         set_layout.addRow(self.set_ai)
+
+        # Gqrx config helper — writes a known-good ~/.config/gqrx/default.conf
+        # so the user doesn't have to hunt for "Audio UDP" / "Remote control"
+        # menu items that vary across Gqrx versions.
+        gqrx_cfg_box = QGroupBox("Gqrx setup")
+        gqrx_cfg_layout = QVBoxLayout(gqrx_cfg_box)
+        gqrx_cfg_intro = QLabel(
+            "Click the button below to write a known-good Gqrx config that enables:\n"
+            "  • Remote control TCP on 127.0.0.1:7356\n"
+            "  • Audio UDP stream to 127.0.0.1:7355\n\n"
+            "Your existing config is backed up first. After writing, quit Gqrx\n"
+            "(if running) and re-launch it for the changes to take effect."
+        )
+        gqrx_cfg_intro.setWordWrap(True)
+        gqrx_cfg_layout.addWidget(gqrx_cfg_intro)
+
+        self.gqrx_cfg_btn = QPushButton("🔧 Setup Gqrx config")
+        self.gqrx_cfg_btn.clicked.connect(self._setup_gqrx_config)
+        gqrx_cfg_layout.addWidget(self.gqrx_cfg_btn)
+
+        self.gqrx_inspect_btn = QPushButton("🔍 Inspect Gqrx config")
+        self.gqrx_inspect_btn.clicked.connect(self._inspect_gqrx_config)
+        gqrx_cfg_layout.addWidget(self.gqrx_inspect_btn)
+
+        set_layout.addRow(gqrx_cfg_box)
+
         self.tabs.addTab(set_widget, "Settings")
 
         splitter.addWidget(right)
@@ -506,17 +532,23 @@ class MainWindow(QMainWindow):
         else:
             ok = self.gqrx.connect()
             if not ok:
-                QMessageBox.warning(
+                # Offer to auto-write the Gqrx config so the user doesn't
+                # have to hunt through Gqrx's menus (which vary across
+                # versions and may not even have an Audio UDP item).
+                reply = QMessageBox.question(
                     self, "Cannot connect to Gqrx",
                     f"Could not connect to Gqrx at {self.config.gqrx_host}:{self.config.gqrx_port}.\n\n"
-                    "Make sure Gqrx is running and remote control is enabled:\n"
-                    "  Tools → Remote control settings → Enable remote control (port 7356)\n\n"
-                    "For audio + waterfall, also enable:\n"
-                    "  Tools → Audio UDP → host 127.0.0.1, port 7355, click Start\n"
-                    "  (This is a SEPARATE menu from Remote control settings.)\n\n"
-                    "And press the green ▶ Play button in Gqrx's main window.\n\n"
-                    "See QUICKSTART.md for step-by-step instructions."
+                    "This means Gqrx is not running, OR its remote control TCP\n"
+                    "is not enabled on port 7356.\n\n"
+                    "Quickest fix — let Magic SDR write a known-good Gqrx config\n"
+                    "for you (backups your existing one first)?\n\n"
+                    "  • Yes  → writes ~/.config/gqrx/default.conf with remote\n"
+                    "           control + audio UDP enabled; then you re-launch Gqrx.\n"
+                    "  • No   → I'll set it up manually in Gqrx's menus.",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
                 )
+                if reply == QMessageBox.Yes:
+                    self._setup_gqrx_config()
                 return
             # Start audio + spectrum receivers
             self.audio_receiver.start()
@@ -713,18 +745,39 @@ class MainWindow(QMainWindow):
             lines.append(f"  Current: {f/1e6:.4f} MHz · {self.config.last_modulation} · {b.name if b else 'Custom'}")
             lines.append("")
 
-        # 5. Recommendations
+        # 5. Gqrx config file inspection
+        lines.append("── Gqrx config file ──")
+        try:
+            from .gqrx_config import inspect_gqrx_config
+            config_report = inspect_gqrx_config()
+            # Indent each line of the report for readability inside the dialog
+            for line in config_report.splitlines():
+                lines.append(f"  {line}")
+        except Exception as e:
+            lines.append(f"  (could not read Gqrx config: {e})")
+        lines.append("")
+
+        # 6. Recommendations
         lines.append("── What to do ──")
         if not self.gqrx.is_connected():
-            lines.append("  1. Open Gqrx")
-            lines.append("  2. Tools → Remote control settings → Enable remote control")
-            lines.append("  3. Click Connect in Magic SDR")
+            lines.append("  ★ Fastest fix: open Settings tab → click '🔧 Setup Gqrx config'")
+            lines.append("    (writes a known-good ~/.config/gqrx/default.conf with remote")
+            lines.append("    control + audio UDP enabled, backs up your existing config first)")
+            lines.append("")
+            lines.append("  Then:")
+            lines.append("  1. Quit Gqrx completely (File → Quit) if it's running")
+            lines.append("  2. Re-launch Gqrx:  gqrx &")
+            lines.append("  3. In Gqrx, press the green ▶ Play button")
+            lines.append("  4. Back in Magic SDR, click Connect")
         else:
             if lvl is None or (lvl is not None and lvl < -90):
                 lines.append("  ★ Press the green ▶ Play button in Gqrx's main window.")
                 lines.append("    (This is the #1 cause of 0 stations — Gqrx isn't actively receiving.)")
             if not self.audio_receiver.is_streaming(max_age_s=2.0):
-                lines.append("  • Tools → Audio UDP → enable, host 127.0.0.1, port 7355, Start")
+                lines.append("  • No audio UDP flowing. Either:")
+                lines.append("    (a) Settings tab → '🔧 Setup Gqrx config' (auto-writes the config),")
+                lines.append("        then quit Gqrx, re-launch, and press ▶ Play")
+                lines.append("    (b) Manually: Tools → Audio UDP → enable, host 127.0.0.1, port 7355, Start")
             if self.config.gain_db < 1.0:
                 lines.append("  • Increase RF Gain to ~40 dB (it was 0)")
             if lvl is not None and lvl < -90:
@@ -736,6 +789,35 @@ class MainWindow(QMainWindow):
         lines.append("")
         lines.append("See QUICKSTART.md for step-by-step Gqrx setup.")
         return "\n".join(lines)
+
+    def _setup_gqrx_config(self) -> None:
+        """Write a known-good Gqrx config (called from Settings tab + connect-error dialog)."""
+        from .gqrx_config import setup_gqrx_config
+        result = setup_gqrx_config()
+        if not result.ok:
+            QMessageBox.critical(
+                self, "Gqrx setup failed",
+                result.message
+            )
+            return
+        # Show the result and the next-step instructions
+        msg_type = QMessageBox.Information if result.changes else QMessageBox.Information
+        QMessageBox.information(
+            self, "Gqrx config written" if result.changes else "Gqrx config OK",
+            result.message
+        )
+        # If we made changes, the user needs to re-launch Gqrx — offer to retry the connection
+        if result.changes and not self.gqrx.is_connected():
+            self.status.showMessage(
+                "Gqrx config written. Quit & re-launch Gqrx, then click Connect.",
+                8000
+            )
+
+    def _inspect_gqrx_config(self) -> None:
+        """Show what's currently in Gqrx's config file (read-only)."""
+        from .gqrx_config import inspect_gqrx_config
+        report = inspect_gqrx_config()
+        QMessageBox.information(self, "Gqrx config inspection", report)
 
     def _on_freq_changed(self, freq_hz: int) -> None:
         self.dial.set_frequency(freq_hz)

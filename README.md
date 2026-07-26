@@ -76,14 +76,24 @@ Open Gqrx and configure:
    - Device: `RTL-SDR` → your dongle
    - Sample rate: 2.4 MS/s
    - For HF (shortwave): Direct sampling = **Q-branch**
+   - **RF Gain: ~40 dB** (NOT 0 — 0 dB means the receiver is deaf)
 
-2. **Tools → Remote control settings**:
-   - ☑ **Enable remote control**  — TCP port `7356`
-   - ☑ **Enable audio UDP stream** — host `127.0.0.1`, port `7355`, 48 kHz, **stereo**, format 16-bit signed PCM
-   - ☑ **Enable spectrum UDP stream** — host `127.0.0.1`, port `7357`
-   - (For all three, the host is `127.0.0.1` because Magic SDR Player runs on the same machine.)
+2. **Remote control TCP** — `Tools → Remote control settings`:
+   - ☑ **Enable remote control** — TCP port `7356`
 
-3. Start Gqrx receiving (the green ▶ button).
+3. **Audio UDP stream** — `Tools → Audio UDP` (separate menu, not a tab inside Remote control settings):
+   - ☑ Enable — host `127.0.0.1`, port `7355`, 48 kHz, **stereo**, 16-bit signed PCM
+
+4. Press the green ▶ **Play** button in Gqrx's main window to start the receiver.
+
+> 💡 **Tip — don't want to hunt through menus?** Open Magic SDR's Settings tab and click
+> `🔧 Setup Gqrx config`. This writes a known-good `~/.config/gqrx/default.conf` (with
+> remote control + audio UDP enabled) and backs up your existing config first. Then just
+> quit Gqrx and re-launch it — no menu hunting required.
+>
+> ⚠ **About spectrum UDP**: stock Gqrx has NO spectrum UDP stream option. Magic SDR
+> computes a real-time FFT from the audio stream and draws the waterfall from that —
+> you don't need a spectrum stream.
 
 ## ✦ Run
 
@@ -156,14 +166,26 @@ The poller thread queries `f`, `m`, `l STRENGTH` every 500 ms and emits Qt signa
 ## ✦ Troubleshooting
 
 **"Cannot connect to Gqrx at 127.0.0.1:7356"**
-→ Make sure Gqrx is running and remote control is enabled (Tools → Remote control settings → ☑ Enable remote control).
+→ Gqrx isn't running, or its remote control TCP isn't enabled on port 7356.
+→ **Quickest fix:** open the Settings tab in Magic SDR → click `🔧 Setup Gqrx config`.
+  This writes a known-good `~/.config/gqrx/default.conf` (backing up your existing one first),
+  enabling both remote control (TCP 7356) and audio UDP (127.0.0.1:7355). Then quit & re-launch Gqrx.
+→ **Manual fix:** in Gqrx, `Tools → Remote control settings → ☑ Enable remote control`.
 
 **No audio in the desktop app**
-→ Check `Tools → Remote control settings → Audio UDP stream` is enabled and set to port 7355, 48 kHz, stereo, 16-bit PCM.
+→ Enable Gqrx's audio UDP stream (host 127.0.0.1, port 7355). This is in `Tools → Audio UDP`
+  (a separate menu from Remote control settings). If your Gqrx version doesn't have this menu
+  item, use the `🔧 Setup Gqrx config` button in Magic SDR's Settings tab to write the config
+  file directly.
 → Make sure your speakers are connected and not muted.
 
 **Waterfall is blank**
-→ Enable `Spectrum UDP stream` in Gqrx remote control settings (port 7357). On older Gqrx versions this option may be missing — the app still works, just without the waterfall.
+→ Press the green ▶ Play button in Gqrx's main window — until Gqrx is actively receiving,
+  no audio gets streamed and `l STRENGTH` returns nothing.
+→ Also enable Gqrx's audio UDP stream (see above) — Magic SDR draws the waterfall from a
+  real-time FFT of the audio. Stock Gqrx has NO spectrum UDP stream; the app falls back to
+  audio-FFT automatically when no UDP spectrum data arrives on port 7357.
+→ Click `🔍 Inspect Gqrx config` in the Settings tab to verify the config file.
 
 **No audio in the web UI**
 → Browsers require a user gesture before allowing audio. Click anywhere on the page once to enable playback.

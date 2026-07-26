@@ -80,11 +80,25 @@ In Gqrx, configure these THREE things (each in a different menu):
 - UDP port: `7355`
 - Sample rate: 48 kHz, Stereo, 16-bit PCM
 
+> 💡 **Don't see `Audio UDP` in Gqrx's Tools menu?** Some Gqrx versions don't have it.
+> Skip the manual steps b + c and use the auto-config:
+>
+> 1. Launch Magic SDR (`./run.sh`)
+> 2. Open the **Settings** tab
+> 3. Click **🔧 Setup Gqrx config** — this writes a known-good
+>    `~/.config/gqrx/default.conf` (enables remote control on port 7356
+>    and audio UDP on 127.0.0.1:7355) and **backs up your existing config first**
+> 4. Quit Gqrx completely (`File → Quit`)
+> 5. Re-launch Gqrx (`gqrx &`)
+>
+> You can verify what's in Gqrx's config anytime by clicking
+> **🔍 Inspect Gqrx config** in the same Settings tab.
+
 > ⚠ **Important — Gqrx menu layout**
 > - The TCP remote control setting is in `Tools → Remote control settings`.
 > - The Audio UDP stream is in `Tools → Audio UDP` — a **separate menu item**,
 >   NOT a tab inside Remote control settings. If you don't see it, your Gqrx
->   may be older; update to Gqrx 2.11+.
+>   may be older; use the auto-config above, or update to Gqrx 2.11+.
 > - There is NO "Spectrum UDP stream" option in stock Gqrx. Magic SDR draws
 >   the waterfall from a real-time FFT of the audio stream instead, so you
 >   don't need it.
@@ -137,11 +151,17 @@ Open `http://192.168.1.42:8000` on your phone's browser (must be on the same Wi-
 This is the #1 issue. Click **🩺 Diagnose** for an exact diagnosis.
 Common causes, in order of frequency:
 
+0. **Gqrx not running, or not configured** → Open Magic SDR's **Settings** tab
+   and click **🔧 Setup Gqrx config**. This writes a known-good Gqrx config
+   (enables remote control + audio UDP) and backs up your existing one.
+   Then quit Gqrx, re-launch, press ▶ Play, and click Connect.
 1. **Gqrx receiver is paused** → press the green ▶ Play button in Gqrx's
    main window. If Gqrx isn't actively receiving, `l STRENGTH` returns
    nothing and the scanner finds nothing.
 2. **Audio UDP stream not enabled in Gqrx** → `Tools → Audio UDP` (separate
    menu item) → enable, host `127.0.0.1`, port `7355`, click Start.
+   If your Gqrx doesn't have this menu item, use the `🔧 Setup Gqrx config`
+   button in the Settings tab instead.
 3. **RF Gain is 0** → in Gqrx Device settings (gear icon), set RF Gain to
    ~40 dB. (Magic SDR tries to set this automatically on connect, but if
    you reset it to 0 manually the receiver becomes deaf.)
@@ -163,7 +183,7 @@ Common causes, in order of frequency:
 
 | Symptom | Fix |
 |---|---|
-| `Cannot connect to Gqrx at 127.0.0.1:7356` | Gqrx isn't running, or remote control isn't enabled. Recheck step 4b. |
+| `Cannot connect to Gqrx at 127.0.0.1:7356` | Gqrx isn't running, or remote control isn't enabled. Click **🔧 Setup Gqrx config** in the Settings tab to auto-write Gqrx's config, then quit & re-launch Gqrx. |
 | No audio in desktop app | Audio UDP stream not enabled in Gqrx. `Tools → Audio UDP`, port 7355, 48 kHz stereo 16-bit. |
 | Waterfall is black | Press ▶ Play in Gqrx, then enable Audio UDP. Click 🩺 Diagnose to verify. |
 | No audio in browser | Browsers need a user gesture. Click anywhere on the page once. |

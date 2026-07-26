@@ -116,3 +116,64 @@ Stage Summary:
 - Audio-FFT waterfall fallback means the waterfall won't be black even without UDP spectrum — it shows the demodulated audio spectrum centered on the tuned frequency.
 - Audio RMS level gives a fallback signal-strength indicator when `l STRENGTH` returns nothing.
 - The #1 cause of "0 stations found" is now correctly identified as "Gqrx receiver is paused — press the green ▶ Play button".
+
+---
+Task ID: scan-fix-4
+Agent: Super Z (main)
+Task: User reported that the message "Could not connect to Gqrx at 127.0.0.1:7356" was appearing (showing the OLD message text mentioning "Audio UDP stream" and "Spectrum UDP stream" as separate enable steps, which is misleading — when TCP can't connect, UDP can't be tested either). Build a real fix that lets the user auto-configure Gqrx instead of hunting through menus that vary across versions.
+
+Work Log:
+- Built new module: magic_sdr/gqrx_config.py
+  - setup_gqrx_config() — writes a known-good ~/.config/gqrx/default.conf with:
+    [remote_control] enabled=true, port=7356, host=""
+    [audio_udp] enabled=true, host=127.0.0.1, port=7355, sample_rate=48000, stereo=true
+  - Preserves all existing keys (dongle, gain, receiver, bookmarks) — merges instead of overwriting.
+  - Backs up the existing config to default.conf.bak-<unix-time> before writing.
+  - Returns a GqrxConfigResult with ok, config_path, backup_path, message, changes list.
+  - inspect_gqrx_config() — read-only summary of the [remote_control] and [audio_udp] sections with ✓/✗ marks.
+  - Handles missing config, malformed config, and is idempotent (no-op when already correct).
+- main_window.py changes:
+  - Settings tab now has a "Gqrx setup" group box with two buttons:
+    * 🔧 Setup Gqrx config — calls setup_gqrx_config(), shows result + next-step instructions
+    * 🔍 Inspect Gqrx config — calls inspect_gqrx_config(), shows current state
+  - _on_connect_clicked() TCP failure: instead of dumping stale advice, now offers
+    the auto-config (QMessageBox.question Yes/No). If Yes, calls _setup_gqrx_config().
+    If No, the user is left to do it manually (per QUICKSTART.md).
+  - _build_diagnostic_report() now includes a "Gqrx config file" section showing
+    the current [remote_control] + [audio_udp] state. Also updated "What to do"
+    section to point to the Setup button as the fastest fix.
+- README.md changes:
+  - Replaced the bogus "Spectrum UDP stream" troubleshooting line with accurate
+    guidance (press ▶ Play, enable Audio UDP, no spectrum stream needed).
+  - Replaced the "Configure Gqrx" section's claim that all 3 streams are in
+    Remote control settings with the correct separate-menu layout, plus a
+    tip pointing to the auto-config button.
+- QUICKSTART.md changes:
+  - Added a "💡 Don't see Audio UDP in Gqrx's Tools menu?" callout that gives
+    the 5-step auto-config path (Launch Magic SDR → Settings tab → 🔧 Setup
+    Gqrx config → Quit Gqrx → Re-launch Gqrx).
+  - Updated "0 stations found" troubleshooting list to include item 0:
+    "Gqrx not running or not configured → use 🔧 Setup Gqrx config".
+  - Updated the "Cannot connect" symptom row in the table.
+
+Tests:
+- New test file: scripts/test_gqrx_config.py — 8 tests, all pass:
+  1. setup_gqrx_config writes a known-good config from scratch
+  2. setup_gqrx_config preserves existing keys + creates backup
+  3. setup_gqrx_config is idempotent (2nd call = no changes)
+  4. inspect_gqrx_config returns readable summary
+  5. inspect_gqrx_config gracefully handles missing file
+  6. setup_gqrx_config reports error on malformed config
+  7. main_window imports cleanly with gqrx_config integration
+  8. MainWindow has Setup Gqrx config button + handlers
+- All 8 existing functional tests still pass.
+- Scanner health test still passes (12 stations found in mock band).
+
+Stage Summary:
+- The user no longer needs to hunt for "Audio UDP" or "Spectrum UDP" menu items
+  in Gqrx (which vary across versions and may not exist).
+- One click on 🔧 Setup Gqrx config writes a known-good config (with backup).
+- Diagnose dialog now shows what's actually in Gqrx's config file.
+- All messaging (TCP failure, banner, diagnose, README, QUICKSTART) consistently
+  points to the auto-config as the fastest path.
+- The "Spectrum UDP stream" myth is fully eliminated from all user-facing docs.
