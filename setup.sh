@@ -46,22 +46,34 @@ if [ ! -f "$UDEV_RULE" ]; then
 fi
 
 # --- Python packages ---
-PY=python3
-if [ -x "/home/z/.venv/bin/python3" ]; then PY=/home/z/.venv/bin/python3; fi
+# Prefer an active virtualenv if the user has one; fall back to system python3.
+PY="${PYTHON:-python3}"
+if [ ! -x "$(command -v "$PY")" ]; then
+    echo "Python 3 not found. Install python3 and try again."
+    exit 1
+fi
 echo ""
+echo "Using Python: $($PY --version 2>&1) at $(command -v "$PY")"
 echo "Installing Python packages via $PY…"
 $PY -m pip install --upgrade pip
 $PY -m pip install -r requirements.txt
 
 # --- Node packages for AI helper ---
-echo ""
-echo "Installing Node packages for AI tagging…"
-cd scripts
-if [ ! -d node_modules ]; then
-    npm init -y >/dev/null
-    npm install z-ai-web-dev-sdk
+if command -v npm >/dev/null; then
+    echo ""
+    echo "Installing Node packages for AI tagging…"
+    cd scripts
+    if [ ! -d node_modules ] || [ ! -f node_modules/z-ai-web-dev-sdk/package.json ]; then
+        npm init -y >/dev/null
+        npm install z-ai-web-dev-sdk
+    fi
+    cd ..
+else
+    echo ""
+    echo "⚠ npm not found — skipping AI tagger setup. The app will still run;"
+    echo "  AI tagging will return 'unknown' for every signal."
+    echo "  To enable: install Node.js + run 'cd scripts && npm install z-ai-web-dev-sdk'"
 fi
-cd ..
 
 # --- Bookmarks default ---
 if [ ! -f bookmarks.json ]; then

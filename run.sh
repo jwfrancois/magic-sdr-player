@@ -8,14 +8,16 @@
 set -e
 cd "$(dirname "$0")"
 
-# Pick the right Python
-if [ -x "/home/z/.venv/bin/python3" ]; then
-    PY=/home/z/.venv/bin/python3
-elif command -v python3 >/dev/null; then
-    PY=python3
-else
+# Pick the right Python: honor $PYTHON if set, else use python3.
+PY="${PYTHON:-python3}"
+if [ ! -x "$(command -v "$PY")" ]; then
     echo "Python 3 not found. Install python3 and try again."
     exit 1
+fi
+
+# If a virtualenv is active, prefer it over $PYTHON
+if [ -n "$VIRTUAL_ENV" ] && [ -x "$VIRTUAL_ENV/bin/python3" ]; then
+    PY="$VIRTUAL_ENV/bin/python3"
 fi
 
 # Quick health-check: is Gqrx running?
@@ -33,4 +35,4 @@ if ! pgrep -x gqrx >/dev/null; then
     [[ $REPLY =~ ^[Yy]$ ]] || exit 0
 fi
 
-exec $PY -m magic_sdr.main "$@"
+exec "$PY" -m magic_sdr.main "$@"

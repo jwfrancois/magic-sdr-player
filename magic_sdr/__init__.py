@@ -4,6 +4,8 @@ __version__ = "1.0.0"
 __app_name__ = "Magic SDR Player"
 __author__ = "Magic SDR"
 
+import os
+
 # Default network ports (must match Gqrx → Tools → Remote control settings)
 GQRX_REMOTE_HOST = "127.0.0.1"
 GQRX_REMOTE_PORT = 7356       # Gqrx TCP remote control
@@ -14,8 +16,10 @@ GQRX_SPECTRUM_PORT = 7357     # Gqrx UDP spectrum stream (if enabled)
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8000
 
-# Filesystem
-APP_DIR = "/home/z/my-project"
-RECORDINGS_DIR = f"{APP_DIR}/recordings"
-BOOKMARKS_FILE = f"{APP_DIR}/bookmarks.json"
-CONFIG_FILE = f"{APP_DIR}/config.json"
+# Filesystem — resolved relative to the project root, NOT hardcoded.
+# This makes the project fully portable: copy the folder anywhere and run.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APP_DIR = _PROJECT_ROOT
+RECORDINGS_DIR = os.path.join(APP_DIR, "recordings")
+BOOKMARKS_FILE = os.path.join(APP_DIR, "bookmarks.json")
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
