@@ -6,11 +6,17 @@ __author__ = "Magic SDR"
 
 import os
 
-# Default network ports (must match Gqrx → Tools → Remote control settings)
+# Default network ports
+# GQRX_REMOTE_PORT: TCP remote control — set in Gqrx: Tools → Remote control settings
+# GQRX_AUDIO_PORT:  UDP audio stream — set in Gqrx: Tools → Audio UDP (separate menu!)
+# GQRX_SPECTRUM_PORT: UDP spectrum stream — NOT supported by stock Gqrx. We keep
+#                     the receiver for compatibility with patched forks, but the
+#                     app falls back to audio-FFT waterfall when no data arrives
+#                     on this port (which is the normal case).
 GQRX_REMOTE_HOST = "127.0.0.1"
 GQRX_REMOTE_PORT = 7356       # Gqrx TCP remote control
-GQRX_AUDIO_PORT = 7355        # Gqrx UDP audio stream (set in Gqrx → Audio UDP)
-GQRX_SPECTRUM_PORT = 7357     # Gqrx UDP spectrum stream (if enabled)
+GQRX_AUDIO_PORT = 7355        # Gqrx UDP audio stream (Tools → Audio UDP)
+GQRX_SPECTRUM_PORT = 7357     # Gqrx UDP spectrum stream (rare; not in stock Gqrx)
 
 # Web UI
 WEB_HOST = "0.0.0.0"

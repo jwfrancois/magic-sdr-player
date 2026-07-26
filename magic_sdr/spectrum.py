@@ -1,19 +1,31 @@
-"""UDP spectrum receiver + waterfall widget for Gqrx's spectrum stream.
+"""Spectrum source + waterfall widget for Magic SDR.
 
-Gqrx 2.14+ can stream FFT/spectrum data over UDP. Configure in Gqrx via:
-  Tools → Remote control settings → Spectrum UDP stream → enable
-  UDP host: 127.0.0.1, UDP port: 7357
-  Format: raw float32 complex (or magnitude, depending on Gqrx version)
+There are TWO sources of spectrum data:
 
-Packet format (Gqrx 2.15+):
-  The spectrum is sent as raw IEEE-754 float32 little-endian magnitude values
-  (dBFS) with no header. Each packet contains the full FFT (typically 256–2048
-  bins). A new packet is sent ~20 times per second.
+1. **UDP spectrum stream** (SpectrumReceiver) — listens on UDP port 7357 for
+   incoming FFT magnitude data. NOTE: stock Gqrx does NOT support this; it
+   only exists in some patched forks. We keep the receiver for compatibility,
+   but most users will not have this.
 
-We also support computing a fallback "audio spectrum" from the audio stream —
-useful for older Gqrx versions or when the user hasn't enabled the spectrum
-server. The fallback gives a 0–24 kHz spectrum (audio band) instead of the
-full RF band, but it still makes for a nice visualization.
+2. **Audio FFT fallback** (AudioSpectrumSource) — computes a real-time FFT
+   from Gqrx's audio UDP stream (port 7355, available in all Gqrx versions
+   via Tools → Audio UDP). The result is an audio-band spectrum (0–24 kHz
+   for 48 kHz sample rate) centered on the tuned RF frequency. This is what
+   most users will see.
+
+The WaterfallWidget accepts spectrum data from either source via
+`update_spectrum(data, center_hz, span_hz)`.
+
+Audio FFT waterfall caveats:
+  - The X axis represents audio frequencies (0 to sample_rate/2), NOT the
+    full RF band. We label the axis as RF frequencies (centered on the tuned
+    frequency ± sample_rate/4) for visual continuity, but the actual content
+    is the demodulated audio.
+  - For AM/FM/WFM signals, you'll see the carrier, sidebands, and audio
+    content as peaks.
+  - For SSB, you'll see the voice audio spectrum.
+  - This is NOT a substitute for an RF spectrum analyzer — it's a
+    visualization of what the demodulator is hearing.
 """
 
 from __future__ import annotations
@@ -149,6 +161,79 @@ class SpectrumReceiver(QObject):
             self.spectrum_ready.emit(arr, self.center_hz, self.span_hz)
 
 
+class AudioSpectrumSource(QObject):
+    """Computes a real-time spectrum from demodulated audio chunks.
+
+    This is the DEFAULT spectrum source for Magic SDR, because stock Gqrx
+    does not stream RF spectrum data over UDP. We compute an FFT of the
+    incoming audio (already demodulated by Gqrx) and present it as a
+    "spectrum" centered on the tuned RF frequency.
+
+    The result is an audio-band FFT (0 to sample_rate/2, typically 0–24 kHz).
+    On the waterfall, we map this onto an RF frequency range centered on the
+    tuned frequency with a span of sample_rate/2. This isn't physically
+    accurate (the audio band isn't an RF band), but it gives the user a useful
+    visualization of what the demodulator is producing.
+
+    Emits `spectrum_ready(np.ndarray, center_hz, span_hz)` — same signature
+    as SpectrumReceiver, so the WaterfallWidget doesn't care which one is
+    feeding it.
+    """
+
+    spectrum_ready = pyqtSignal(object, int, int)  # data, center_hz, span_hz
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.center_hz: int = 96_900_000  # updated when freq changes
+        self.span_hz: int = 24_000        # default: 48 kHz sample rate / 2
+        self._fft_size: int = 1024
+        self._window: Optional[np.ndarray] = None
+        # Track how many FFTs we've emitted, for diagnostic purposes
+        self._fft_count: int = 0
+
+    def set_band_context(self, center_hz: int, span_hz: int) -> None:
+        """Update the center frequency. span_hz is ignored — audio FFT span
+        is always sample_rate/2.
+        """
+        self.center_hz = int(center_hz)
+
+    def process_audio(self, chunk: np.ndarray, sample_rate: int, channels: int) -> None:
+        """Compute FFT of an audio chunk and emit as spectrum.
+
+        chunk: int16 ndarray, shape (N,) for mono or (N, 2) for stereo.
+        """
+        if chunk is None or chunk.size == 0:
+            return
+        # Convert to mono if stereo
+        if channels == 2 and chunk.ndim == 2:
+            chunk = chunk.mean(axis=1)
+        # Need at least fft_size samples
+        n = min(len(chunk), self._fft_size)
+        if n < 32:
+            return
+        # Take the most recent N samples
+        samples = chunk[-n:].astype(np.float32) / 32768.0
+        # Hann window
+        if self._window is None or len(self._window) != n:
+            self._window = np.hanning(n).astype(np.float32)
+        windowed = samples * self._window
+        # rFFT → magnitude in dBFS
+        fft = np.fft.rfft(windowed)
+        # Normalize by N/2 for amplitude, then convert to dBFS
+        mag = np.abs(fft) / (n / 2.0)
+        # Avoid log(0)
+        mag = np.maximum(mag, 1e-7)
+        mag_db = 20.0 * np.log10(mag).astype(np.float32)
+        # Update span based on actual sample rate
+        span = sample_rate // 2
+        self.span_hz = span
+        self._fft_count += 1
+        self.spectrum_ready.emit(mag_db, self.center_hz, span)
+
+    def fft_count(self) -> int:
+        return self._fft_count
+
+
 class WaterfallWidget(QWidget):
     """Combined spectrum + waterfall display.
 
@@ -164,6 +249,9 @@ class WaterfallWidget(QWidget):
         super().__init__(parent)
         self.center_hz: int = 96_900_000
         self.span_hz: int = 2_000_000
+        # "RF" = real RF spectrum (from UDP spectrum stream, rare);
+        # "Audio" = audio-band FFT (default fallback when no UDP spectrum)
+        self.mode: str = "RF"
         self.waterfall_history_lines = 256
         self.waterfall_height = 256
         self.waterfall_width = 1024
@@ -187,6 +275,13 @@ class WaterfallWidget(QWidget):
         self.spectrum_plot.setLabel("bottom", "Frequency", units="Hz")
         self.spectrum_plot.setLabel("left", "Level", units="dBFS")
         self.spectrum_curve = self.spectrum_plot.plot(pen=pg.mkPen("#5cd9ff", width=1.5))
+        # Mode label (top-right of spectrum plot)
+        self.mode_label = pg.TextItem(anchor=(1, 0), color="#8b96a7")
+        self.mode_label.setText("RF spectrum (idle)")
+        self.spectrum_plot.addItem(self.mode_label)
+        self.spectrum_plot.setXRange(self.center_hz - self.span_hz / 2,
+                                      self.center_hz + self.span_hz / 2, padding=0)
+        self.spectrum_plot.setYRange(-100, 0, padding=0)
         # Marker for current tuned frequency
         self.tune_marker = pg.InfiniteLine(angle=90, pen=pg.mkPen("#ff5c5c", width=1.5))
         self.spectrum_plot.addItem(self.tune_marker)
@@ -245,13 +340,32 @@ class WaterfallWidget(QWidget):
                                        self.center_hz + self.span_hz / 2, padding=0)
         self.tune_marker.setPos(self.center_hz)
         self.waterfall_marker.setPos(self.center_hz)
+        # Position the mode label at the top-right corner of the spectrum plot
+        self.mode_label.setPos(self.center_hz + self.span_hz / 2 * 0.98, -5)
 
     def update_spectrum(self, data: np.ndarray, center_hz: int, span_hz: int) -> None:
-        """Update spectrum + waterfall with a new FFT magnitude array (dBFS)."""
+        """Update spectrum + waterfall with a new FFT magnitude array (dBFS).
+
+        The data source (RF UDP spectrum vs Audio FFT) is auto-detected from
+        the span: a span >= 100 kHz means RF spectrum; smaller means audio FFT.
+        """
         if len(data) == 0:
             return
-        if center_hz != self.center_hz or span_hz != self.span_hz:
+        # Auto-detect mode from span. Audio FFT has span = sample_rate/2 (~24 kHz).
+        # RF spectrum has span >= 100 kHz typically.
+        new_mode = "Audio" if span_hz < 100_000 else "RF"
+        if new_mode != self.mode or center_hz != self.center_hz or span_hz != self.span_hz:
+            self.mode = new_mode
             self.set_band_context(center_hz, span_hz)
+            if self.mode == "Audio":
+                self.mode_label.setText(f"Audio FFT · {span_hz/1000:.0f} kHz span")
+                self.mode_label.setColor("#ffd45c")
+                # Audio FFT levels are typically much lower than RF dBFS; widen range
+                self.waterfall_image.setLevels([-90.0, -20.0])
+            else:
+                self.mode_label.setText(f"RF spectrum · {span_hz/1e6:.2f} MHz span")
+                self.mode_label.setColor("#5cffaa")
+                self.waterfall_image.setLevels([-80.0, -10.0])
         # X-axis: each bin maps to a frequency
         n = len(data)
         f_start = center_hz - span_hz / 2
@@ -263,8 +377,11 @@ class WaterfallWidget(QWidget):
                              np.arange(n), data)
         # Shift down
         self._img_data[1:] = self._img_data[:-1]
-        # Map dBFS to 0..255
-        v = np.clip((col_data + 80) / 70, 0, 1)
+        # Map dBFS to 0..255 — use mode-appropriate range
+        if self.mode == "Audio":
+            v = np.clip((col_data + 90) / 70, 0, 1)
+        else:
+            v = np.clip((col_data + 80) / 70, 0, 1)
         self._img_data[0] = (v * 255).astype(np.uint8)
         # Set image — coordinates are (x=left,right, y=bottom,top)
         self.waterfall_image.setImage(self._img_data,

@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
 
 from .gqrx_client import GqrxClient, MODULATIONS
 from .audio_receiver import AudioReceiver, AudioPlayer
-from .spectrum import SpectrumReceiver, WaterfallWidget
+from .spectrum import SpectrumReceiver, AudioSpectrumSource, WaterfallWidget
 from .band_scanner import BandScanner, DiscoveredStation
 from .bookmark_manager import BookmarkManager, Bookmark
 from .recording_manager import RecordingManager
@@ -120,6 +120,10 @@ class MainWindow(QMainWindow):
         )
         self.audio_player.set_volume(config.volume)
         self.spectrum_receiver = SpectrumReceiver(port=config.spectrum_port)
+        # Audio-FFT spectrum source — the DEFAULT when Gqrx isn't providing
+        # UDP spectrum data (which is the normal case for stock Gqrx, since
+        # Gqrx doesn't have a UDP spectrum stream feature).
+        self.audio_spectrum = AudioSpectrumSource()
         self.bookmarks = BookmarkManager()
         self.recordings = RecordingManager()
         self.scanner = BandScanner(self.gqrx)
@@ -442,11 +446,19 @@ class MainWindow(QMainWindow):
         self.gqrx.signal_level.connect(self._on_signal_level)
         self.gqrx.error.connect(self._on_gqrx_error)
 
-        # Audio → player + recording
+        # Audio → player + recording + audio-FFT spectrum fallback
         self.audio_receiver.chunk_ready.connect(self._on_audio_chunk)
 
-        # Spectrum → waterfall
+        # Spectrum sources → waterfall
+        # 1. UDP spectrum (rare — only patched Gqrx forks). When packets arrive
+        #    they take priority (RF spectrum is more accurate than audio FFT).
         self.spectrum_receiver.spectrum_ready.connect(
+            lambda data, c, s: self.waterfall.update_spectrum(data, c, s)
+        )
+        # 2. Audio-FFT fallback — always active, computes spectrum from the
+        #    demodulated audio stream. Shows up automatically when no UDP
+        #    spectrum packets are arriving (which is the normal case).
+        self.audio_spectrum.spectrum_ready.connect(
             lambda data, c, s: self.waterfall.update_spectrum(data, c, s)
         )
 
@@ -498,11 +510,12 @@ class MainWindow(QMainWindow):
                     self, "Cannot connect to Gqrx",
                     f"Could not connect to Gqrx at {self.config.gqrx_host}:{self.config.gqrx_port}.\n\n"
                     "Make sure Gqrx is running and remote control is enabled:\n"
-                    "  Tools → Remote control settings → Enable remote control\n\n"
-                    "Also enable (REQUIRED for audio + waterfall):\n"
-                    "  • Audio UDP stream → UDP port 7355\n"
-                    "  • Spectrum UDP stream → UDP port 7357\n\n"
-                    "See QUICKSTART.md for screenshots and step-by-step instructions."
+                    "  Tools → Remote control settings → Enable remote control (port 7356)\n\n"
+                    "For audio + waterfall, also enable:\n"
+                    "  Tools → Audio UDP → host 127.0.0.1, port 7355, click Start\n"
+                    "  (This is a SEPARATE menu from Remote control settings.)\n\n"
+                    "And press the green ▶ Play button in Gqrx's main window.\n\n"
+                    "See QUICKSTART.md for step-by-step instructions."
                 )
                 return
             # Start audio + spectrum receivers
@@ -546,40 +559,49 @@ class MainWindow(QMainWindow):
 
     # ----------------------------- diagnostics -----------------------------
     def _update_diagnostic_banner(self) -> None:
-        """Update the top banner based on UDP stream health.
+        """Update the top banner based on stream health.
 
-        The banner appears when Gqrx is connected but the user hasn't enabled
-        the UDP audio / spectrum streams inside Gqrx's settings — the single
-        most common cause of "0 stations found" and a black waterfall.
+        The banner appears when Gqrx is connected but the user hasn't:
+          - Pressed Play ▶ in Gqrx (receiver is paused → no signal)
+          - Enabled the Audio UDP stream in Gqrx (Tools → Audio UDP)
+          - Set RF Gain > 0
+        These are the common causes of "0 stations found" and a black waterfall.
         """
         if not self.gqrx.is_connected():
             self.diag_banner.setVisible(False)
             return
         audio_ok = self.audio_receiver.is_streaming(max_age_s=3.0)
-        spec_ok = self.spectrum_receiver.is_streaming(max_age_s=3.0)
         audio_count = self.audio_receiver.packet_count()
-        spec_count = self.spectrum_receiver.packet_count()
 
-        if audio_ok and spec_ok:
+        # Audio UDP is the ONLY UDP stream Gqrx supports. (Stock Gqrx has no
+        # spectrum UDP stream.) So we only check audio.
+        if audio_ok:
             self.diag_banner.setVisible(False)
             return
 
         # Build a clear, actionable message
-        parts = ["<b>⚠ Gqrx streams not configured</b> — this is why the waterfall "
-                 "is black and the scanner finds 0 stations. Gqrx's TCP control "
-                 "works, but it is NOT sending UDP audio / spectrum data to Magic SDR."]
+        parts = ["<b>⚠ Gqrx is connected but not streaming audio</b> — this is why "
+                 "the scanner finds 0 stations and the waterfall is silent. "
+                 "Gqrx's TCP control works (we can change frequency), but Gqrx "
+                 "isn't sending audio to Magic SDR."]
         parts.append("")
         parts.append(f"Audio UDP (port 7355): {'OK — ' + str(audio_count) + ' pkts' if audio_ok else 'NOT receiving'}")
-        parts.append(f"Spectrum UDP (port 7357): {'OK — ' + str(spec_count) + ' pkts' if spec_ok else 'NOT receiving'}")
         parts.append("")
-        parts.append("<b>Fix in Gqrx:</b>")
-        parts.append("  1. Tools → Remote control settings → check 'Enable remote control'")
-        parts.append("  2. Same dialog → Audio UDP → set host 127.0.0.1, port 7355, click Start")
-        parts.append("  3. Same dialog → Spectrum UDP → set host 127.0.0.1, port 7357, click Start")
-        parts.append("  4. In Gqrx's main window, press the Play button ▶ to start the receiver")
-        parts.append("  5. Set Gqrx's RF Gain to ~40 dB (Hardware opts → RF gain slider)")
+        parts.append("<b>Fix — 3 steps in Gqrx (do all of them):</b>")
+        parts.append("  1. <b>Press the green ▶ Play button</b> in Gqrx's main window "
+                     "(top toolbar). If Gqrx isn't actively receiving, no audio "
+                     "gets streamed and `l STRENGTH` returns nothing.")
+        parts.append("  2. <b>Tools → Audio UDP</b> → check the box to enable, "
+                     "set host 127.0.0.1, port 7355, click Start. "
+                     "(This is a SEPARATE menu from Remote control settings.)")
+        parts.append("  3. <b>Set RF Gain to ~40 dB</b> in Gqrx's Device settings "
+                     "(gear icon) — 0 dB gain = deaf receiver.")
         parts.append("")
-        parts.append("Then click 🩺 Diagnose to verify, and ▶ Scan again.")
+        parts.append("Note: stock Gqrx does NOT have a Spectrum UDP stream. "
+                     "Magic SDR will draw the waterfall from the audio FFT instead, "
+                     "so you don't need a spectrum stream.")
+        parts.append("")
+        parts.append("Click 🩺 Diagnose for a full report.")
         self.diag_banner.setText("<br>".join(parts))
         self.diag_banner.setVisible(True)
 
@@ -618,37 +640,50 @@ class MainWindow(QMainWindow):
 
         # 2. UDP audio
         lines.append("── UDP audio stream (port 7355) ──")
+        lines.append("  (Configured in Gqrx: Tools → Audio UDP — NOT in Remote control settings)")
         if self.audio_receiver.is_running():
             cnt = self.audio_receiver.packet_count()
             age = self.audio_receiver.last_packet_age_s()
             if self.audio_receiver.is_streaming(max_age_s=2.0):
                 lines.append(f"  ✓ Streaming — {cnt} packets received, last {age:.2f}s ago")
+                # Also report audio RMS as a fallback signal-strength indicator
+                rms = self.audio_receiver.get_audio_rms_db()
+                if rms is not None:
+                    lines.append(f"  Audio RMS level: {rms:.1f} dBFS")
+                    if rms < -60:
+                        lines.append("    ⚠ Audio is very quiet — receiver may be paused in Gqrx,")
+                        lines.append("      or tuned to a dead frequency, or antenna disconnected.")
+                    elif rms < -30:
+                        lines.append("    ✓ Audio is reasonable — you should hear something.")
+                    else:
+                        lines.append("    ✓ Strong audio — receiver is definitely receiving.")
             elif cnt > 0:
                 lines.append(f"  ⚠ Was streaming ({cnt} packets) but stale ({age:.1f}s ago)")
                 lines.append("    → Gqrx may have stopped, or receiver paused.")
             else:
                 lines.append("  ✗ NOT receiving any audio packets since connect.")
-                lines.append("    → In Gqrx: Tools → Remote control settings →")
-                lines.append("      Audio UDP stream → host 127.0.0.1, port 7355, click Start.")
+                lines.append("    → In Gqrx:")
+                lines.append("      1. Press the green ▶ Play button in the main window")
+                lines.append("      2. Tools → Audio UDP → enable, host 127.0.0.1, port 7355, Start")
         else:
             lines.append("  ✗ Audio receiver not running (not connected to Gqrx).")
         lines.append("")
 
-        # 3. UDP spectrum
+        # 3. UDP spectrum (informational — usually absent in stock Gqrx)
         lines.append("── UDP spectrum stream (port 7357) ──")
+        lines.append("  (Stock Gqrx does NOT support this. Magic SDR uses audio FFT as fallback.)")
         if self.spectrum_receiver.is_running():
             cnt = self.spectrum_receiver.packet_count()
-            age = self.spectrum_receiver.last_packet_age_s()
             if self.spectrum_receiver.is_streaming(max_age_s=2.0):
-                lines.append(f"  ✓ Streaming — {cnt} packets received, last {age:.2f}s ago")
+                lines.append(f"  ✓ Streaming — {cnt} packets received (rare — likely a patched Gqrx)")
             elif cnt > 0:
+                age = self.spectrum_receiver.last_packet_age_s()
                 lines.append(f"  ⚠ Was streaming ({cnt} packets) but stale ({age:.1f}s ago)")
             else:
-                lines.append("  ✗ NOT receiving any spectrum packets since connect.")
-                lines.append("    → In Gqrx: Tools → Remote control settings →")
-                lines.append("      Spectrum UDP stream → host 127.0.0.1, port 7357, click Start.")
+                lines.append("  · No packets received (normal for stock Gqrx).")
+                lines.append("    Waterfall will use audio FFT instead — see top of waterfall plot.")
         else:
-            lines.append("  ✗ Spectrum receiver not running (not connected to Gqrx).")
+            lines.append("  · Spectrum receiver not running.")
         lines.append("")
 
         # 4. Signal level + gain
@@ -656,9 +691,11 @@ class MainWindow(QMainWindow):
             lines.append("── Signal level + RF gain ──")
             lvl = self.gqrx.get_signal_level_robust(n_samples=3, interval_s=0.05)
             if lvl is None:
-                lines.append("  ✗ Gqrx did not return a signal level — try `l STRENGTH` manually.")
+                lines.append("  ✗ Gqrx did not return a signal level.")
+                lines.append("    → Most likely cause: Gqrx receiver is PAUSED.")
+                lines.append("    → Press the green ▶ Play button in Gqrx's main window.")
             else:
-                lines.append(f"  Signal level: {lvl:.1f} dBFS")
+                lines.append(f"  Signal level (l STRENGTH): {lvl:.1f} dBFS")
                 if lvl < -90:
                     lines.append("  ⚠ Very low — likely no antenna, gain=0, or receiver paused in Gqrx.")
                 elif lvl < -75:
@@ -683,21 +720,21 @@ class MainWindow(QMainWindow):
             lines.append("  2. Tools → Remote control settings → Enable remote control")
             lines.append("  3. Click Connect in Magic SDR")
         else:
+            if lvl is None or (lvl is not None and lvl < -90):
+                lines.append("  ★ Press the green ▶ Play button in Gqrx's main window.")
+                lines.append("    (This is the #1 cause of 0 stations — Gqrx isn't actively receiving.)")
             if not self.audio_receiver.is_streaming(max_age_s=2.0):
-                lines.append("  • Enable Audio UDP stream in Gqrx (port 7355)")
-            if not self.spectrum_receiver.is_streaming(max_age_s=2.0):
-                lines.append("  • Enable Spectrum UDP stream in Gqrx (port 7357)")
+                lines.append("  • Tools → Audio UDP → enable, host 127.0.0.1, port 7355, Start")
             if self.config.gain_db < 1.0:
                 lines.append("  • Increase RF Gain to ~40 dB (it was 0)")
             if lvl is not None and lvl < -90:
-                lines.append("  • Check antenna is plugged in")
-                lines.append("  • Press Play ▶ in Gqrx to start the receiver")
+                lines.append("  • Check antenna is plugged into the RTL-SDR SMA connector")
             if (self.audio_receiver.is_streaming(max_age_s=2.0)
-                    and self.spectrum_receiver.is_streaming(max_age_s=2.0)
                     and lvl is not None and lvl > -75):
                 lines.append("  ✓ Everything looks healthy — try scanning again.")
+                lines.append("    (Scanner doesn't need UDP streams — only needs TCP control + signal.)")
         lines.append("")
-        lines.append("See QUICKSTART.md for step-by-step Gqrx setup with screenshots.")
+        lines.append("See QUICKSTART.md for step-by-step Gqrx setup.")
         return "\n".join(lines)
 
     def _on_freq_changed(self, freq_hz: int) -> None:
@@ -728,6 +765,10 @@ class MainWindow(QMainWindow):
         if self.recordings.is_recording:
             lvl = self.gqrx.get_signal_level() or -120.0
             self.recordings.write_chunk(chunk, sample_rate, channels, signal_level_db=lvl)
+        # Audio-FFT spectrum fallback — only feed if no UDP spectrum is arriving
+        # (avoid wasting CPU computing FFTs when we have real RF spectrum data)
+        if not self.spectrum_receiver.is_streaming(max_age_s=1.0):
+            self.audio_spectrum.process_audio(chunk, sample_rate, channels)
 
     def _tune_to(self, freq_hz: int) -> None:
         if not self.gqrx.is_connected():
@@ -855,6 +896,8 @@ class MainWindow(QMainWindow):
             span = 2_000_000
         self.waterfall.set_band_context(freq_hz, span)
         self.spectrum_receiver.set_band_context(freq_hz, span)
+        # Audio FFT only needs center freq; its span is sample_rate/2
+        self.audio_spectrum.set_band_context(freq_hz, span)
 
     # ----------------------------- bookmarks -----------------------------
     def _refresh_bookmarks(self, query: str = "") -> None:
@@ -1027,22 +1070,24 @@ class MainWindow(QMainWindow):
         )
         self.scan_progress.setValue(100)
         if len(found) == 0:
-            # Check if streams are healthy — if not, the cause is upstream
-            # (Gqrx not streaming UDP), not the scanner threshold.
+            # Check if audio is flowing (the best indicator that Gqrx is
+            # actually receiving). If not, the cause is upstream (Gqrx
+            # paused or Audio UDP not enabled), not the scanner threshold.
             audio_ok = self.audio_receiver.is_streaming(max_age_s=3.0)
-            spec_ok = self.spectrum_receiver.is_streaming(max_age_s=3.0)
-            if not audio_ok or not spec_ok:
+            if not audio_ok:
                 self.scan_live_label.setText(
-                    "0 stations found — Gqrx is NOT streaming UDP audio/spectrum "
-                    "to Magic SDR. Click 🩺 Diagnose for the exact fix."
+                    "0 stations found — Gqrx isn't streaming audio to Magic SDR. "
+                    "Press ▶ in Gqrx + enable Tools → Audio UDP (port 7355). "
+                    "Click 🩺 Diagnose for the full report."
                 )
                 self.scan_live_label.setStyleSheet(
                     "color: #ff8a8a; font-family: monospace; padding: 2px;"
                 )
             else:
                 self.scan_live_label.setText(
-                    "0 stations found — streams are healthy. Try 🔬 Test Sweep to "
-                    "see all signal levels, or check antenna / try a different band."
+                    "0 stations found — audio is flowing but no signal exceeds threshold. "
+                    "Try 🔬 Test Sweep to see all signal levels, or check antenna / "
+                    "try a different band / tune to a known active frequency."
                 )
                 self.scan_live_label.setStyleSheet(
                     "color: #5cd9ff; font-family: monospace; padding: 2px;"

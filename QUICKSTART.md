@@ -62,30 +62,41 @@ The setup script will detect the active virtualenv via `$VIRTUAL_ENV` and instal
 gqrx &
 ```
 
-In Gqrx, configure:
+In Gqrx, configure these THREE things (each in a different menu):
 
-**Device settings** (gear icon, top-left):
+### a) Device settings (gear icon, top-left of Gqrx)
 - Device: `RTL-SDR` → your dongle
 - Sample rate: `2.4 MS/s`
 - For HF/shortwave: Direct sampling = `Q-branch`
 - **RF Gain: set to ~40 dB** (NOT 0 — gain 0 means the receiver is deaf)
 
-**Tools → Remote control settings** (this dialog has THREE separate sections, all required):
-- ☑ Enable remote control — TCP port `7356`
-- ☑ Enable audio UDP stream — host `127.0.0.1`, port `7355`, 48 kHz, stereo, 16-bit PCM
-- ☑ Enable spectrum UDP stream — host `127.0.0.1`, port `7357`
+### b) TCP remote control — `Tools → Remote control settings`
+- ☑ Enable remote control
+- TCP port: `7356`
 
-> ⚠ **Critical**: All three streams must be enabled. The TCP control connection
-> (port 7356) is what Magic SDR uses to *command* Gqrx (set frequency, set
-> modulation, read signal level). The UDP audio stream (port 7355) is what
-> Magic SDR uses to *hear* what Gqrx receives. The UDP spectrum stream
-> (port 7357) is what Magic SDR uses to *draw the waterfall*. If you only
-> enable TCP, you'll see "Connected" but the waterfall will be black and the
-> scanner will find 0 stations.
+### c) Audio UDP stream — `Tools → Audio UDP` (separate menu!)
+- ☑ Enable audio UDP streaming
+- UDP host: `127.0.0.1`
+- UDP port: `7355`
+- Sample rate: 48 kHz, Stereo, 16-bit PCM
 
-Click the green ▶ in Gqrx to start receiving. You should see Gqrx's own
-waterfall come alive with signals — if Gqrx's own waterfall is black, Magic
-SDR's will be too.
+> ⚠ **Important — Gqrx menu layout**
+> - The TCP remote control setting is in `Tools → Remote control settings`.
+> - The Audio UDP stream is in `Tools → Audio UDP` — a **separate menu item**,
+>   NOT a tab inside Remote control settings. If you don't see it, your Gqrx
+>   may be older; update to Gqrx 2.11+.
+> - There is NO "Spectrum UDP stream" option in stock Gqrx. Magic SDR draws
+>   the waterfall from a real-time FFT of the audio stream instead, so you
+>   don't need it.
+
+### d) Press the green ▶ Play button in Gqrx's main window
+
+This is the most-overlooked step. Gqrx has a Play/Pause button in the top
+toolbar — until you press it, Gqrx is not actually receiving anything, and
+`l STRENGTH` returns nothing (so the scanner finds 0 stations).
+
+You should see Gqrx's own waterfall come alive with signals. If Gqrx's
+waterfall is black, Magic SDR's will be too — fix Gqrx first.
 
 ---
 
@@ -97,13 +108,13 @@ SDR's will be too.
 
 The desktop window opens. Click **Connect** to attach to Gqrx. You should see:
 - Frequency display (defaults to 96.9 MHz)
-- Live waterfall with click-to-tune
+- Live waterfall (audio-FFT based — shows the demodulated audio spectrum
+  centered on the tuned frequency, span = 24 kHz)
 - Bookmark list (88 known channels pre-loaded)
 - A **Remote Access** widget showing the URL `http://0.0.0.0:8000`
 
-If the waterfall is black or a scan finds 0 stations, click the **🩺 Diagnose**
-button next to Connect — it will tell you exactly which of the three streams
-isn't working and what to fix.
+If the waterfall is still black or a scan finds 0 stations, click the **🩺 Diagnose**
+button next to Connect — it will tell you exactly what's missing.
 
 ---
 
@@ -123,31 +134,38 @@ Open `http://192.168.1.42:8000` on your phone's browser (must be on the same Wi-
 
 ### "0 stations found" / waterfall is black
 
-This is the #1 issue. It means Magic SDR can command Gqrx (TCP control works)
-but is not receiving any UDP audio/spectrum data. Click **🩺 Diagnose** for an
-exact diagnosis. Common causes, in order of frequency:
+This is the #1 issue. Click **🩺 Diagnose** for an exact diagnosis.
+Common causes, in order of frequency:
 
-1. **Audio UDP stream not enabled in Gqrx** → Tools → Remote control settings →
-   Audio UDP stream → host `127.0.0.1`, port `7355`, click Start.
-2. **Spectrum UDP stream not enabled in Gqrx** → same dialog → Spectrum UDP
-   stream → host `127.0.0.1`, port `7357`, click Start.
-3. **Gqrx receiver is paused** → press the green ▶ button in Gqrx's main
-   window so it actually starts receiving.
-4. **RF Gain is 0** → in Gqrx Device settings, set RF Gain to ~40 dB.
-   (Magic SDR tries to set this automatically on connect, but if you reset
-   it to 0 manually the receiver becomes deaf.)
-5. **Antenna not connected** → RTL-SDR V3 needs an antenna plugged into the
+1. **Gqrx receiver is paused** → press the green ▶ Play button in Gqrx's
+   main window. If Gqrx isn't actively receiving, `l STRENGTH` returns
+   nothing and the scanner finds nothing.
+2. **Audio UDP stream not enabled in Gqrx** → `Tools → Audio UDP` (separate
+   menu item) → enable, host `127.0.0.1`, port `7355`, click Start.
+3. **RF Gain is 0** → in Gqrx Device settings (gear icon), set RF Gain to
+   ~40 dB. (Magic SDR tries to set this automatically on connect, but if
+   you reset it to 0 manually the receiver becomes deaf.)
+4. **Antenna not connected** → RTL-SDR V3 needs an antenna plugged into the
    SMA connector to receive anything.
-6. **Tuned to a dead frequency** → 108.0 MHz is the top edge of the FM band
+5. **Tuned to a dead frequency** → 108.0 MHz is the top edge of the FM band
    and often has nothing. Try 96.9 MHz, 98.5 MHz, or 101.1 MHz.
+
+> **Note about Spectrum UDP**: stock Gqrx does NOT support a UDP spectrum
+> stream. Magic SDR was originally designed assuming it did — that was
+> wrong. The app now computes a real-time FFT from the audio stream and
+> uses that to draw the waterfall. The waterfall's X-axis represents audio
+> frequencies (0–24 kHz) centered on the tuned RF frequency, not the full
+> RF band — but it's a useful visualization of what the demodulator is
+> hearing. The scanner does NOT need any UDP streams — it reads signal
+> strength directly via TCP `l STRENGTH`.
 
 ### Other symptoms
 
 | Symptom | Fix |
 |---|---|
-| `Cannot connect to Gqrx at 127.0.0.1:7356` | Gqrx isn't running, or remote control isn't enabled. Recheck step 4. |
-| No audio in desktop app | Audio UDP stream not enabled in Gqrx. Port 7355, 48 kHz, stereo, 16-bit PCM. |
-| Waterfall is blank | Spectrum UDP stream not enabled. Port 7357. Click 🩺 Diagnose to verify. |
+| `Cannot connect to Gqrx at 127.0.0.1:7356` | Gqrx isn't running, or remote control isn't enabled. Recheck step 4b. |
+| No audio in desktop app | Audio UDP stream not enabled in Gqrx. `Tools → Audio UDP`, port 7355, 48 kHz stereo 16-bit. |
+| Waterfall is black | Press ▶ Play in Gqrx, then enable Audio UDP. Click 🩺 Diagnose to verify. |
 | No audio in browser | Browsers need a user gesture. Click anywhere on the page once. |
 | `Permission denied: /dev/bus/usb/...` | udev rule didn't apply. Unplug & replug the dongle, or reboot. |
 | AI tags say "unavailable" | Run `cd scripts && npm install z-ai-web-dev-sdk` manually. |

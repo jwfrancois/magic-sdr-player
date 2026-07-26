@@ -57,6 +57,8 @@ class AudioReceiver(QObject):
         # large), the user has NOT enabled the UDP audio stream in Gqrx.
         self._packet_count: int = 0
         self._last_packet_time: float = 0.0
+        # Most recent audio chunk (for fallback RMS signal-level computation)
+        self._last_chunk: Optional[np.ndarray] = None
 
     def start(self) -> bool:
         if self._running:
@@ -72,6 +74,7 @@ class AudioReceiver(QObject):
             self._running = True
             self._packet_count = 0
             self._last_packet_time = 0.0
+            self._last_chunk = None
             self._thread = threading.Thread(target=self._loop, daemon=True,
                                             name=f"AudioRecv:{self.port}")
             self._thread.start()
@@ -115,6 +118,27 @@ class AudioReceiver(QObject):
             return False
         return (time.time() - self._last_packet_time) <= max_age_s
 
+    # ---- Fallback signal level (RMS of recent audio) ----
+    # When Gqrx's `l STRENGTH` returns nothing useful (e.g., receiver paused
+    # or unsupported version), we can estimate signal presence from the RMS
+    # amplitude of the received audio. This isn't dBFS in the strict sense,
+    # but it's a useful "is anything being received?" indicator.
+    def get_audio_rms_db(self) -> Optional[float]:
+        """Return the RMS level of the most recent audio chunk, in dBFS.
+
+        Computed as 20*log10(rms/32767) for int16 samples.
+        Returns None if no audio has arrived yet.
+        """
+        if self._last_chunk is None or self._last_chunk.size == 0:
+            return None
+        try:
+            rms = float(np.sqrt(np.mean(self._last_chunk.astype(np.float32) ** 2)))
+            if rms <= 0:
+                return -120.0
+            return max(-120.0, min(0.0, 20.0 * np.log10(rms / 32767.0)))
+        except Exception:
+            return None
+
     def _loop(self) -> None:
         bytes_per_sample = 2  # int16
         frame_size = bytes_per_sample * self.channels
@@ -137,6 +161,8 @@ class AudioReceiver(QObject):
             arr = np.frombuffer(data[:n_full], dtype=np.int16)
             if self.channels == 2:
                 arr = arr.reshape(-1, 2)
+            # Save reference for fallback RMS level computation
+            self._last_chunk = arr
             self.chunk_ready.emit(arr, self.sample_rate, self.channels)
 
 

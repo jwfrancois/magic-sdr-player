@@ -70,3 +70,49 @@ Stage Summary:
 - The scanner was always working correctly; it just had no signal data to find stations in.
 - App now detects this situation automatically and shows a clear red banner with fix instructions, plus a 🩺 Diagnose button for a full report.
 - Future users hitting this issue will see the banner appear ~2.5 seconds after clicking Connect, with no need to read docs.
+
+---
+Task ID: scan-fix-3
+Agent: Super Z (main)
+Task: User reported that Gqrx's Tools → Remote control settings only has ONE port (7356) — they can't find Audio UDP Stream or Spectrum UDP Stream options. Fix the app's assumptions.
+
+Work Log:
+- Realized I was WRONG about Gqrx having a Spectrum UDP stream — stock Gqrx does NOT support this. Only patched forks do.
+- The Audio UDP stream IS in Gqrx but at a SEPARATE menu: Tools → Audio UDP (not a tab inside Remote control settings).
+- The real reason for "0 stations found" is most likely that Gqrx isn't actively receiving — the user needs to press the green Play button in Gqrx's main window. Without that, `l STRENGTH` returns nothing useful.
+
+Fixes applied:
+1. spectrum.py:
+   - Updated module docstring to be honest about Gqrx: stock Gqrx has no UDP spectrum stream.
+   - Added new AudioSpectrumSource class that computes a real-time FFT from audio chunks (1024-sample Hann-windowed rFFT). Emits spectrum_ready(np.ndarray, center_hz, span_hz) — same signature as SpectrumReceiver, so WaterfallWidget accepts both.
+   - Added mode indicator (top-right of spectrum plot) showing "RF spectrum" or "Audio FFT" with the active span.
+   - WaterfallWidget now auto-detects mode from span (< 100 kHz = Audio, >= 100 kHz = RF) and uses appropriate dBFS range.
+2. audio_receiver.py:
+   - Added _last_chunk field that stores the most recent audio chunk.
+   - Added get_audio_rms_db() method that computes RMS level in dBFS — a fallback signal-strength indicator when `l STRENGTH` returns nothing.
+3. main_window.py:
+   - Imported AudioSpectrumSource and instantiated it.
+   - Wired audio_receiver.chunk_ready → AudioPlayer (playback) + RecordingManager (if recording) + AudioSpectrumSource (only when no UDP spectrum is flowing).
+   - Updated _update_band_context to also inform audio_spectrum.
+   - Rewrote _update_diagnostic_banner: now only checks audio UDP (since spectrum UDP doesn't exist in stock Gqrx). Tells user the 3-step fix: 1) Press ▶ Play in Gqrx, 2) Tools → Audio UDP, 3) Set RF Gain to ~40 dB.
+   - Rewrote _build_diagnostic_report: shows audio RMS as fallback signal level, explains spectrum UDP isn't supported in stock Gqrx, prioritizes "press Play" as #1 fix.
+   - Updated _on_connect_clicked error message with correct menu paths.
+   - Updated _on_scan_finished to only check audio UDP (not spectrum UDP) for the "0 stations" message.
+4. __init__.py: Updated port comments to clarify that GQRX_SPECTRUM_PORT is rare / not in stock Gqrx.
+5. QUICKSTART.md: Complete rewrite of section 4 — split into a/b/c/d sub-steps with the correct menu paths (Tools → Remote control settings for TCP, Tools → Audio UDP for audio, separate step for pressing ▶ Play). Added "Note about Spectrum UDP" callout explaining the fallback.
+
+Tests:
+- All 8 functional tests pass.
+- All imports verify cleanly.
+- AudioSpectrumSource tested with 1 kHz sine wave — correctly detects peak at 982 Hz.
+- AudioSpectrumSource handles stereo input (auto-mono conversion) and skips too-small chunks.
+- WaterfallWidget auto-detects Audio vs RF mode correctly.
+- AudioReceiver.get_audio_rms_db() tested: strong tone → -9.2 dBFS (matches expected), silence → -120 dBFS.
+- MainWindow diagnostic report builds without error and shows correct text.
+- Scanner health test still passes (12 stations found in mock band).
+
+Stage Summary:
+- The biggest fix is documentation/diagnostics: user now knows Audio UDP is at Tools → Audio UDP (separate menu), not in Remote control settings.
+- Audio-FFT waterfall fallback means the waterfall won't be black even without UDP spectrum — it shows the demodulated audio spectrum centered on the tuned frequency.
+- Audio RMS level gives a fallback signal-strength indicator when `l STRENGTH` returns nothing.
+- The #1 cause of "0 stations found" is now correctly identified as "Gqrx receiver is paused — press the green ▶ Play button".
