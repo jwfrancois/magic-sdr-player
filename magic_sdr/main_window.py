@@ -123,6 +123,9 @@ class MainWindow(QMainWindow):
         self.config = config
         self.setWindowTitle("Magic SDR Player — RTL-SDR V3 + Gqrx")
         self.resize(config.window_width, config.window_height)
+        # Prevent the window from shrinking so much that the bottom controls
+        # (memory presets, visualizer, EQ) get clipped.
+        self.setMinimumSize(900, 640)
 
         # ----------------------------- core components -----------------------------
         self.gqrx = GqrxClient(host=config.gqrx_host, port=config.gqrx_port)
@@ -472,7 +475,17 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.time_travel_widget)
 
         left_layout.addStretch(1)
-        splitter.addWidget(left)
+        # Wrap the left control panel in a scroll area so that on short windows
+        # the bottom controls (EQ, Time-Travel, etc.) scroll instead of being
+        # clipped off-screen.
+        from PyQt5.QtWidgets import QScrollArea
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setMinimumWidth(420)
+        splitter.addWidget(left_scroll)
 
         # ----- RIGHT: waterfall + tabs -----
         right = QWidget()
@@ -500,9 +513,9 @@ class MainWindow(QMainWindow):
         viz_row.addWidget(self.viz_mode_combo)
         viz_row.addStretch(1)
         right_layout.addLayout(viz_row)
-        # The visualizer itself — fixed height to keep waterfall dominant
+        # The visualizer itself — compact height to keep waterfall dominant
         viz_container = QWidget()
-        viz_container.setFixedHeight(180)
+        viz_container.setFixedHeight(120)
         viz_container_l = QVBoxLayout(viz_container)
         viz_container_l.setContentsMargins(0, 0, 0, 0)
         viz_container_l.addWidget(self.audio_visualizer)

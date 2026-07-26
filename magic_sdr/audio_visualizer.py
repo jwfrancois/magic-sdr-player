@@ -47,7 +47,7 @@ class AudioVisualizer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.mode = MODE_OSCILLOSCOPE
-        self.setMinimumSize(280, 180)
+        self.setMinimumSize(240, 110)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setToolTip(
             "Audio Visualizer — right-click to change mode\n"

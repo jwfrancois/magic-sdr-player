@@ -52,8 +52,8 @@ class MemoryButton(QPushButton):
         super().__init__(parent)
         self.index = index
         self.preset: Optional[MemoryPreset] = None
-        self.setMinimumHeight(54)
-        self.setMinimumWidth(96)
+        self.setMinimumHeight(40)
+        self.setMinimumWidth(72)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         # We manage our own click detection because we want a long-press
         # gesture distinct from a normal click.
@@ -98,8 +98,8 @@ class MemoryButton(QPushButton):
             "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
             "    stop:0 #141a24, stop:1 #0c1018);"
             "  color: #4a5266;"
-            "  border: 1px solid #2a3447; border-radius: 6px;"
-            "  padding: 6px; font-family: 'JetBrains Mono'; font-size: 10px;"
+            "  border: 1px solid #2a3447; border-radius: 5px;"
+            "  padding: 3px; font-family: 'JetBrains Mono'; font-size: 9px;"
             "  text-align: center;"
             "}"
             "QPushButton:hover { border-color: #3a4458; color: #6a7280; }"
@@ -111,8 +111,8 @@ class MemoryButton(QPushButton):
             "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
             "    stop:0 #1e2a3a, stop:1 #16202e);"
             "  color: #5cd9ff;"
-            "  border: 1px solid #3a5a7a; border-radius: 6px;"
-            "  padding: 6px; font-family: 'JetBrains Mono'; font-size: 10px;"
+            "  border: 1px solid #3a5a7a; border-radius: 5px;"
+            "  padding: 3px; font-family: 'JetBrains Mono'; font-size: 9px;"
             "  text-align: center; font-weight: 600;"
             "}"
             "QPushButton:hover {"
@@ -168,13 +168,13 @@ class MemoryPresetBar(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(1)
 
         # Caption
         caption = QLabel("◉ Memory Presets")
         caption.setStyleSheet(
-            "color: #8b96a7; font-size: 10px; font-weight: 600; "
-            "padding: 2px 4px;"
+            "color: #8b96a7; font-size: 9px; font-weight: 600; "
+            "padding: 0px 4px;"
         )
         caption.setToolTip(
             "Memory Presets — like car radio buttons.\n"
@@ -186,7 +186,7 @@ class MemoryPresetBar(QWidget):
 
         # Button row
         btn_row = QGridLayout()
-        btn_row.setSpacing(3)
+        btn_row.setSpacing(2)
         self.buttons: List[MemoryButton] = []
         # 2 rows of 6 buttons
         cols = 6
