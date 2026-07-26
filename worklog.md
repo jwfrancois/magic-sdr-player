@@ -299,3 +299,157 @@ Stage Summary:
   lines for UI integration.
 - All tests pass (8 functional + 8 gqrx_config + scanner health + 13 new
   features = 30+ tests).
+
+---
+Task ID: magic-upgrade-2.0
+Agent: Super Z (main)
+Task: User said: "The player looks good, but still feels basic. Make it look magical with features and functionality. Add presets to the EQ. Strive to surprise me."
+
+Work Log:
+- Created magic_sdr/eq_presets.py — 16 named EQ presets:
+  Flat, Loudness, Bass Boost, Treble Boost, Vocal Clarity, Speech/News,
+  Music (V), AM Vintage, FM HiFi, Shortwave/SSB, Aviation ATC, Cinematic,
+  Open Air, Tube Warm, Crisp Modern, Headphone. Each is a 10-tuple of dB
+  gains for the ISO bands. Includes find_closest_preset() that computes
+  Euclidean distance from current slider state to suggest the nearest preset.
+- Created magic_sdr/audio_visualizer.py — 4-mode real-time visualizer:
+  • Oscilloscope — green trace with grid + 3-layer glow effect
+  • Spectrum Bars — 32 log-spaced bars with rainbow gradient + peak-hold markers
+  • Circular — 64 radial spectrum rays orbiting a pulsing center
+  • Liquid Light — 6 drifting colored blobs driven by FFT bands, 70s psychedelic
+  Right-click cycles modes. Runs at 20 fps.
+- Created magic_sdr/memory_presets.py — 12 car-radio-style instant-tune buttons:
+  • Click → tunes to stored freq
+  • Long-press (800ms) → stores current station
+  • Right-click → clears slot
+  Each button shows M#, freq, label. Filled vs empty slots have distinct styling.
+- Created magic_sdr/time_travel.py — 30-second circular audio rewind buffer:
+  • TimeTravelBuffer: numpy ring buffer, push() + read_range() with absolute frame index
+  • TimeTravelWidget: slider + LIVE/REPLAY indicator + "▶ Live" button
+  • When slider is at right = live passthrough; anywhere else = replay mode
+  • Buffer always records; playback switches between live and replay
+- Created magic_sdr/cw_decoder.py — real-time Morse code decoder:
+  • Rectifies audio + boxcar envelope + adaptive threshold
+  • Detects on/off transitions and classifies marks as dit/dah
+  • Adaptive dit-duration estimation from observed marks
+  • Maps to International Morse Code + prosigns (<AR>, <SK>, etc.)
+  • Uses SAMPLE-COUNT-based timing (not wall-clock) for robustness
+  • WPM estimate = 1200 / (dit_duration_ms)
+- Created magic_sdr/dx_cluster.py — telnet DX cluster client:
+  • Tries 5 cluster nodes in order (W9PA, VE7CC, NC7J, W1NR, DB0SUE)
+  • Auto-reconnect every 30s on disconnect
+  • Parses spot lines: "DX de W1XYZ: 14025.0 DL1ABC CW 23 dB 1830Z"
+  • Keeps last 200 spots in a deque
+  • Emits spot_received + connection_changed Qt signals
+- Created magic_sdr/aurora.py — aurora forecast from K-index:
+  • storm_class_for_kp: Kp≤4=Quiet, 5=G1, 6=G2, 7=G3, 8=G4, 9=G5
+  • oval_latitude_for_kp: ~67 - 2*Kp (rough NOAA ovation model)
+  • hf_absorption_for_kp: None/Minor/Moderate/Significant/Major/Blackout
+  • vhf_scatter_for_kp: None/Possible/Likely/Strong/Excellent
+  • forecast_aurora() returns AuroraForecast with all fields + visibility
+    from observer latitude (with 5° horizon buffer)
+- Created magic_sdr/auto_surf.py — magical "scan all bands" tour:
+  • Sweeps each band, finds strongest signal
+  • Plays each for configurable dwell_seconds (default 5s)
+  • At the end, returns to the overall strongest station
+  • Emits stop_started, surf_progress, surf_finished, surf_error signals
+- Extended magic_sdr/config.py with new persistent fields:
+  eq_preset_name, eq_gains[10], eq_enabled, visualizer_mode,
+  memory_presets[12], cw_decoder_enabled, dx_cluster_enabled,
+  night_vision, time_travel_live, observer_latitude
+- Upgraded magic_sdr/main.py with two stylesheets:
+  • DARK_STYLE — enhanced with gradient buttons, radial-gradient slider handles,
+    hover/pressed/checked states, tooltip styling, scrollbar styling
+  • NIGHT_VISION_STYLE — deep red theme preserving dark adaptation
+    (every color shifted to red/amber spectrum)
+- Major integration in magic_sdr/main_window.py:
+  • Top bar: ClockWidget + ✨ Auto-Surf magic button (purple gradient, checkable)
+  • Memory Presets bar (M1-M12) below top bar — always visible
+  • EQ group: added "Preset:" dropdown with 16 presets + "Custom"
+    • Selecting a preset applies all 10 gains to sliders + EQ
+    • Manual slider adjustments mark preset as "Custom" + status hint
+      showing nearest preset
+    • "Flat" button resets and selects Flat preset
+  • Time-Travel widget below EQ — slider, LIVE/REPLAY label, ▶ Live button
+  • Audio Visualizer below waterfall (180px tall) — dropdown for mode,
+    right-click cycles
+  • New "CW Decoder" tab: enable checkbox, WPM display, current element
+    display, decoded text area (large mono green on black), Clear + Reset
+  • New "DX Cluster" tab: connect button, status label, filter edit, list
+    of spots (color-coded by age), double-click to tune
+  • Conditions tab: added Aurora Forecast section with storm class, oval
+    latitude, visibility from observer, HF absorption, VHF scatter
+  • Settings tab: added "✨ Magic Features" group with Night Vision toggle,
+    DX cluster autostart, CW decoder enable, "Apply Night Vision now" button
+  • Audio chunk handler now feeds: visualizer, time-travel buffer, CW decoder
+    (in addition to existing EQ, player, recording, spectrum, RDS)
+  • _tune_to resets CW decoder + time-travel buffer + forces live mode
+  • _save_magic_state persists all magic-feature state to config.json
+  • closeEvent stops DX cluster + auto-surfer + saves magic state
+  • Added 3 new timers: dx_refresh (5s), cw_refresh (500ms), aurora panel
+    refresh (3s, piggy-backed on conditions_timer)
+- Fixed bug: QQt.QueuedConnection in _on_test_sweep was undefined → changed
+  to Qt.QueuedConnection. (The bug would crash the test-sweep feature.)
+- Created scripts/test_magic_features.py — 172 tests covering all new features:
+  • EQ presets: 16+ presets exist, each has 10 gains, Bass/Treble/V shape
+    verified, find_closest_preset works
+  • Visualizer: 4 modes cycle correctly, accepts stereo + mono int16
+  • Memory Presets: 12 buttons, store/clear/find_slot, long-press callback
+  • Time-Travel: 30s capacity, push 2000+ chunks wraps, read_oldest_n works
+  • CW Decoder: decodes 'E' from dit, 'T' from dah, MORSE_TABLE complete,
+    disabled state passes through
+  • DX Cluster: spot regex matches 3 real-world formats, captures spotter/
+    freq/callsign correctly, DXSpot dataclass works
+  • Aurora: Kp=2 Quiet/63°/not visible, Kp=7 G3/53°/visible-from-50°,
+    Kp=9 G5/49°/visible, Kp=4 not visible from Baltimore mag lat,
+    Kp=8 visible from Baltimore mag lat
+  • Auto-Surf: instantiates, starts, completes with 2 bands in <15s
+  • Config persistence: all new fields round-trip through save/load
+  • MainWindow integration: all 18 new attributes present, EQ preset
+    dropdown has 17+ items, visualizer dropdown has all 4 modes, loading
+    Bass Boost preset applies all 10 gains correctly, _on_audio_chunk
+    doesn't crash, night vision toggle works, _save_magic_state works
+
+Bug found and fixed during testing:
+- CW decoder initially used wall-clock time for mark/space durations. This
+  broke when chunks arrived faster than real-time (e.g. in tests, or when
+  the audio buffer was being drained). Refactored to use sample-count-based
+  timing: _total_samples_processed tracks the absolute sample index,
+  durations are computed as (slice_sample - state_start_sample) / sample_rate.
+- CW decoder's adaptive threshold was computed AFTER processing slices,
+  causing a pure-tone chunk to set the threshold so high that subsequent
+  silence slices couldn't trigger a transition. Fixed by computing the
+  threshold BEFORE the slice loop (using only previous history).
+- CW decoder's initial threshold was 0, which prevented any detection until
+  enough history accumulated. Set initial threshold to 0.05 (~-26 dBFS).
+- CW decoder only flushed letters on transitions, which meant the final
+  letter of a transmission wasn't decoded until the 2-second idle timer
+  fired. Added per-slice silence-duration check that flushes letters at
+  3×dit (inter-char) and 7×dit (inter-word) silence durations.
+
+Tests:
+- All 8 functional tests pass.
+- All 8 gqrx_config tests pass.
+- All 13 round-1 feature tests pass.
+- All 172 round-2 magic feature tests pass.
+- Total: 201 tests passing.
+
+Stage Summary:
+- 16 EQ presets delivered (directly requested) + 8 surprising magical features:
+  1. ✨ EQ Presets — 16 named profiles + "Custom" mode + nearest-preset hint
+  2. ◈ Audio Visualizer — 4 switchable modes (oscilloscope, spectrum bars,
+     circular, liquid light) with rainbow gradients + glow effects
+  3. ◉ Memory Presets — 12 car-radio-style instant-tune buttons with
+     long-press to store + right-click to clear
+  4. ⏮ Time-Travel Audio — 30-second rewind buffer with LIVE/REPLAY slider
+  5. ✦ CW Decoder — real-time Morse code decoding with adaptive WPM
+  6. 🌍 DX Cluster — live telnet feed of worldwide ham spots, click-to-tune
+  7. 🌌 Aurora Forecast — K-index-driven visibility from observer latitude
+  8. ✨ Auto-Surf — magical "scan all bands, play strongest station each"
+     purple button at the top of the window
+  Plus: Night Vision red theme, gradient buttons, glow on slider handles,
+  enhanced tooltips, scrollbars styled, bug fix in test sweep.
+- 8 new Python modules (~1700 lines), main_window.py grew by ~700 lines.
+- All state persists across restarts (EQ gains + preset, visualizer mode,
+  memory presets, CW/DX enable flags, night vision, observer latitude).
+- 201 tests passing across 4 test suites.

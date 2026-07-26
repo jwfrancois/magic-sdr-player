@@ -7,9 +7,18 @@ to /home/z/my-project/config.json so they survive app restarts.
 import json
 import os
 from dataclasses import dataclass, asdict, field
-from typing import Optional
+from typing import Optional, List
 
 from . import CONFIG_FILE
+
+
+@dataclass
+class MemoryPresetData:
+    """One memory preset slot, persisted across restarts."""
+    freq_hz: int = 0
+    modulation: str = ""
+    label: str = ""
+    stored_at: float = 0.0
 
 
 @dataclass
@@ -56,6 +65,37 @@ class Config:
     waterfall_speed: float = 1.0            # multiplier
     window_width: int = 1400
     window_height: int = 900
+
+    # ---- New magical features ----
+    # EQ preset state — name of currently-selected preset, or "Custom" if user
+    # has manually adjusted sliders since loading a preset.
+    eq_preset_name: str = "Flat"
+    # EQ gains (dB) per band — 10 values. Persisted so the EQ state survives
+    # app restarts.
+    eq_gains: List[float] = field(default_factory=lambda: [0.0] * 10)
+    eq_enabled: bool = True
+
+    # Audio visualizer mode — "Oscilloscope", "Spectrum Bars", "Circular", "Liquid Light"
+    visualizer_mode: str = "Oscilloscope"
+
+    # Memory presets — list of MemoryPresetData dicts (12 slots).
+    # We store as list-of-dicts for JSON compatibility.
+    memory_presets: List[dict] = field(default_factory=lambda: [None] * 12)
+
+    # CW decoder state
+    cw_decoder_enabled: bool = True
+
+    # DX cluster state
+    dx_cluster_enabled: bool = True
+
+    # Night vision mode (red theme for dark adaptation)
+    night_vision: bool = False
+
+    # Time-travel buffer state — was the user in replay mode when they closed?
+    time_travel_live: bool = True
+
+    # Observer latitude for aurora forecast (Baltimore, MD by default)
+    observer_latitude: float = 50.0  # magnetic latitude (~geographic 39° + offset)
 
     @classmethod
     def load(cls) -> "Config":

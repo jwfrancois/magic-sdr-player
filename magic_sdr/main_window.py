@@ -46,7 +46,7 @@ from .ai_tagger import AITagger
 from .web_server import WebServer
 from .band_presets import BANDS, BANDS_BY_NAME, band_for_frequency, lookup_known, guess_modulation
 from .config import Config
-# New feature modules
+# New feature modules (round 1 — from previous session)
 from .clock import ClockWidget
 from .tuning_knob import TuningKnob
 from .s_meter import SMeterWidget
@@ -54,6 +54,15 @@ from .equalizer import Equalizer, EQ_BANDS_HZ
 from .solar import SolarFetcher, SolarConditions
 from .band_conditions import estimate_band_conditions, rating_to_stars, band_color
 from .rds import RDSDecoder, RDSInfo, HD_RADIO_INFO_TEXT
+# Magical new features (round 2 — this session)
+from .eq_presets import EQ_PRESETS, get_preset_names, get_preset_gains, find_closest_preset
+from .audio_visualizer import AudioVisualizer, ALL_MODES as VISUALIZER_MODES
+from .memory_presets import MemoryPresetBar, MemoryPreset
+from .time_travel import TimeTravelBuffer, TimeTravelWidget
+from .cw_decoder import CWDecoder
+from .dx_cluster import DXClusterClient, DXSpot
+from .aurora import forecast_aurora, storm_class_for_kp
+from .auto_surf import AutoSurfer, SurfStop
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +162,26 @@ class MainWindow(QMainWindow):
         self.solar_fetcher = SolarFetcher()
         # (Started after first successful Gqrx connect — see _on_gqrx_connected)
 
+        # ---- Magical new feature components ----
+        # Audio visualizer (multi-mode: oscilloscope / spectrum / circular / liquid light)
+        self.audio_visualizer = AudioVisualizer()
+        self.audio_visualizer.set_mode(config.visualizer_mode)
+        # Time-travel audio buffer (30 s rewind)
+        self.time_travel_buffer = TimeTravelBuffer(
+            sample_rate=config.audio_sample_rate,
+            channels=config.audio_channels,
+        )
+        self.time_travel_widget = TimeTravelWidget()
+        # Morse code (CW) decoder — runs in real time on every audio chunk
+        self.cw_decoder = CWDecoder()
+        self.cw_decoder.enabled = config.cw_decoder_enabled
+        # DX Cluster live ticker
+        self.dx_cluster = DXClusterClient()
+        # Auto-surfer — magic "play whatever's loudest" button
+        self.auto_surfer = AutoSurfer(self.gqrx)
+        # Track whether we're in time-travel replay mode (vs live)
+        self._time_travel_replaying = False
+
         # Web server (starts after the rest is wired)
         self.web_server: Optional[WebServer] = None
 
@@ -185,8 +214,22 @@ class MainWindow(QMainWindow):
         self.conditions_timer.setInterval(3000)
         self.conditions_timer.timeout.connect(self._update_conditions)
         self.conditions_timer.timeout.connect(self._update_rds_panel)
+        self.conditions_timer.timeout.connect(self._update_aurora_panel)
         # Start immediately (solar data is independent of Gqrx connection)
         self.conditions_timer.start()
+
+        # DX cluster spot list refresh — re-renders the spot list every 5 s
+        # so the age timestamps stay fresh. Spots themselves arrive
+        # asynchronously via the DXClusterClient thread.
+        self.dx_refresh_timer = QTimer(self)
+        self.dx_refresh_timer.setInterval(5000)
+        self.dx_refresh_timer.timeout.connect(self._refresh_dx_cluster_list)
+
+        # CW decoder WPM + element display refresh — every 500 ms
+        self.cw_refresh_timer = QTimer(self)
+        self.cw_refresh_timer.setInterval(500)
+        self.cw_refresh_timer.timeout.connect(self._refresh_cw_panel)
+        self.cw_refresh_timer.start()
 
         # Apply initial state
         self._apply_config()
@@ -197,7 +240,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        # ---- Top bar: UTC + Local clock ----
+        # ---- Top bar: UTC + Local clock + Auto-Surf magic button ----
         # Always visible at the top of the window, updated every second.
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(0, 0, 0, 0)
@@ -205,7 +248,47 @@ class MainWindow(QMainWindow):
         self.clock = ClockWidget()
         top_bar.addWidget(self.clock)
         top_bar.addStretch(1)
+        # ✨ Auto-Surf magic button — scans every band and plays each strongest station
+        self.auto_surf_btn = QPushButton("✨ Auto-Surf")
+        self.auto_surf_btn.setToolTip(
+            "Auto-Surf — magical tour of the radio dial.\n\n"
+            "Click this and Magic SDR will:\n"
+            "  1. Sweep every supported band (FM, AM, Air, NOAA, Marine, 2m, 70cm, HF)\n"
+            "  2. Find the strongest signal in each band\n"
+            "  3. Play it for 5 seconds\n"
+            "  4. Move on to the next band\n"
+            "  5. Return to the overall strongest station at the end\n\n"
+            "Click again or press Stop to halt."
+        )
+        self.auto_surf_btn.setStyleSheet(
+            "QPushButton {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "    stop:0 #6a3aa0, stop:1 #4a2080);"
+            "  color: #ffd9ff; border: 1px solid #a060d0; border-radius: 6px;"
+            "  padding: 8px 16px; font-weight: 700; font-size: 12px;"
+            "}"
+            "QPushButton:hover {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "    stop:0 #8a5ad0, stop:1 #6a3aa0);"
+            "  color: #ffffff; border-color: #d080ff;"
+            "}"
+            "QPushButton:checked {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "    stop:0 #d080ff, stop:1 #a060d0);"
+            "  color: #0b0f14; border-color: #ffd9ff;"
+            "}"
+        )
+        self.auto_surf_btn.setCheckable(True)
+        self.auto_surf_btn.clicked.connect(self._on_auto_surf_clicked)
+        top_bar.addWidget(self.auto_surf_btn)
         root.addLayout(top_bar)
+
+        # ---- Memory Presets bar (car-radio style M1-M12) ----
+        self.memory_bar = MemoryPresetBar(n_slots=12)
+        self.memory_bar.tune_requested.connect(self._on_memory_tune)
+        # Wire store callback — called when user long-presses a slot
+        self.memory_bar.store_callback = self._make_memory_preset_from_current
+        root.addWidget(self.memory_bar)
 
         # ---- Diagnostic banner (top of window) ----
         # Shows a prominent red/amber message when Gqrx is connected but its
@@ -333,16 +416,20 @@ class MainWindow(QMainWindow):
         web_layout.addWidget(self.web_url)
         left_layout.addWidget(web_box)
 
-        # HiFi EQ — 10-band graphic equalizer
+        # HiFi EQ — 10-band graphic equalizer + 16 named presets
         eq_box = QGroupBox("HiFi Equalizer (10-band)")
         eq_outer = QVBoxLayout(eq_box)
-        # EQ enable checkbox + reset button
+        # EQ enable checkbox + preset dropdown + reset button
         eq_top_row = QHBoxLayout()
         self.eq_enabled_chk = QCheckBox("Enabled")
         self.eq_enabled_chk.setChecked(True)
         self.eq_enabled_chk.toggled.connect(self._on_eq_enabled_toggled)
         eq_top_row.addWidget(self.eq_enabled_chk)
-        eq_top_row.addStretch(1)
+        eq_top_row.addWidget(QLabel("Preset:"))
+        self.eq_preset_combo = QComboBox()
+        self.eq_preset_combo.addItems(["Custom"] + get_preset_names())
+        self.eq_preset_combo.currentTextChanged.connect(self._on_eq_preset_selected)
+        eq_top_row.addWidget(self.eq_preset_combo, stretch=1)
         eq_reset_btn = QPushButton("Flat")
         eq_reset_btn.clicked.connect(self._on_eq_reset)
         eq_top_row.addWidget(eq_reset_btn)
@@ -381,6 +468,9 @@ class MainWindow(QMainWindow):
         eq_outer.addLayout(eq_sliders_row)
         left_layout.addWidget(eq_box)
 
+        # Time-Travel audio buffer — rewind up to 30 seconds of live radio
+        left_layout.addWidget(self.time_travel_widget)
+
         left_layout.addStretch(1)
         splitter.addWidget(left)
 
@@ -392,6 +482,31 @@ class MainWindow(QMainWindow):
         self.waterfall = WaterfallWidget()
         self.waterfall.tune_requested.connect(self._tune_to)
         right_layout.addWidget(self.waterfall, stretch=2)
+
+        # Audio Visualizer — multi-mode live visualization
+        # (oscilloscope / spectrum bars / circular / liquid light)
+        viz_row = QHBoxLayout()
+        viz_row.setContentsMargins(0, 0, 0, 0)
+        viz_label = QLabel("◈ Visualizer")
+        viz_label.setStyleSheet(
+            "color: #8b96a7; font-size: 10px; font-weight: 600; padding: 2px;"
+        )
+        viz_row.addWidget(viz_label)
+        self.viz_mode_combo = QComboBox()
+        self.viz_mode_combo.addItems(VISUALIZER_MODES)
+        self.viz_mode_combo.currentTextChanged.connect(
+            lambda m: self.audio_visualizer.set_mode(m) or self._on_viz_mode_changed(m)
+        )
+        viz_row.addWidget(self.viz_mode_combo)
+        viz_row.addStretch(1)
+        right_layout.addLayout(viz_row)
+        # The visualizer itself — fixed height to keep waterfall dominant
+        viz_container = QWidget()
+        viz_container.setFixedHeight(180)
+        viz_container_l = QVBoxLayout(viz_container)
+        viz_container_l.setContentsMargins(0, 0, 0, 0)
+        viz_container_l.addWidget(self.audio_visualizer)
+        right_layout.addWidget(viz_container)
 
         self.tabs = QTabWidget()
         right_layout.addWidget(self.tabs, stretch=1)
@@ -533,6 +648,42 @@ class MainWindow(QMainWindow):
         self.band_conditions_label.setWordWrap(True)
         band_outer.addWidget(self.band_conditions_label)
         cond_layout.addWidget(band_box)
+
+        # Aurora forecast panel — based on K-index + observer latitude
+        aurora_box = QGroupBox("Aurora Forecast (visible from Baltimore, MD)")
+        aurora_outer = QVBoxLayout(aurora_box)
+        self.aurora_summary_label = QLabel("Loading…")
+        self.aurora_summary_label.setStyleSheet(
+            "font-family: monospace; font-size: 12px; color: #b380ff; padding: 6px;"
+        )
+        self.aurora_summary_label.setWordWrap(True)
+        aurora_outer.addWidget(self.aurora_summary_label)
+        # Detailed aurora fields
+        aurora_grid = QGridLayout()
+        aurora_grid.setSpacing(4)
+        for i, (key, lbl_text) in enumerate([
+            ("storm_class", "Storm Class:"),
+            ("oval_lat", "Auroral Oval:"),
+            ("visible", "Visible From You:"),
+            ("hf_abs", "HF Absorption:"),
+            ("vhf_scatter", "VHF Scatter:"),
+        ]):
+            lbl = QLabel(lbl_text)
+            lbl.setStyleSheet("color: #888;")
+            aurora_grid.addWidget(lbl, i, 0)
+            val = QLabel("—")
+            val.setStyleSheet("color: #fff; font-family: monospace;")
+            val.setWordWrap(True)
+            aurora_grid.addWidget(val, i, 1)
+        self.aurora_detail_labels = {
+            "storm_class": aurora_grid.itemAtPosition(0, 1).widget(),
+            "oval_lat": aurora_grid.itemAtPosition(1, 1).widget(),
+            "visible": aurora_grid.itemAtPosition(2, 1).widget(),
+            "hf_abs": aurora_grid.itemAtPosition(3, 1).widget(),
+            "vhf_scatter": aurora_grid.itemAtPosition(4, 1).widget(),
+        }
+        aurora_outer.addLayout(aurora_grid)
+        cond_layout.addWidget(aurora_box)
         cond_layout.addStretch(1)
         self.tabs.addTab(cond_widget, "Conditions")
 
@@ -590,6 +741,103 @@ class MainWindow(QMainWindow):
         sig_layout.addWidget(hd_box)
         sig_layout.addStretch(1)
         self.tabs.addTab(sig_widget, "Signal Info")
+
+        # CW (Morse) Decoder tab — real-time Morse code decoding
+        cw_widget = QWidget()
+        cw_layout = QVBoxLayout(cw_widget)
+        cw_intro = QLabel(
+            "✦ Morse Code (CW) Decoder — listens to the demodulated audio and "
+            "decodes amplitude-keyed Morse signals in real time.\n\n"
+            "Best on a clean CW signal (e.g. tune to the 30m CW band, 10.100-10.150 MHz). "
+            "The decoder auto-adapts to the operator's WPM speed.\n"
+            "Prosigns like <AR> (end of message) and <SK> (end of contact) are decoded too."
+        )
+        cw_intro.setWordWrap(True)
+        cw_intro.setStyleSheet("color: #ccc; font-size: 11px; padding: 4px;")
+        cw_layout.addWidget(cw_intro)
+
+        # CW controls
+        cw_ctrl_row = QHBoxLayout()
+        self.cw_enabled_chk = QCheckBox("Decode CW")
+        self.cw_enabled_chk.setChecked(self.cw_decoder.enabled)
+        self.cw_enabled_chk.toggled.connect(self._on_cw_enabled_toggled)
+        cw_ctrl_row.addWidget(self.cw_enabled_chk)
+        cw_ctrl_row.addStretch(1)
+        self.cw_wpm_label = QLabel("WPM: —")
+        self.cw_wpm_label.setStyleSheet(
+            "color: #5cd9ff; font-family: 'JetBrains Mono'; font-weight: 600;"
+        )
+        cw_ctrl_row.addWidget(self.cw_wpm_label)
+        cw_ctrl_row.addStretch(1)
+        self.cw_element_label = QLabel("Current: —")
+        self.cw_element_label.setStyleSheet(
+            "color: #ffd45c; font-family: 'JetBrains Mono';"
+        )
+        cw_ctrl_row.addWidget(self.cw_element_label)
+        cw_ctrl_row.addStretch(1)
+        cw_clear_btn = QPushButton("Clear Text")
+        cw_clear_btn.clicked.connect(lambda: self.cw_decoder.clear_text())
+        cw_ctrl_row.addWidget(cw_clear_btn)
+        cw_reset_btn = QPushButton("Reset Decoder")
+        cw_reset_btn.clicked.connect(lambda: self.cw_decoder.reset())
+        cw_ctrl_row.addWidget(cw_reset_btn)
+        cw_layout.addLayout(cw_ctrl_row)
+
+        # Decoded text area — large, monospaced, scrollable
+        from PyQt5.QtWidgets import QTextEdit, QScrollArea
+        self.cw_text_display = QTextEdit()
+        self.cw_text_display.setReadOnly(True)
+        self.cw_text_display.setStyleSheet(
+            "QTextEdit {"
+            "  background-color: #06080c; color: #5cffaa;"
+            "  font-family: 'JetBrains Mono'; font-size: 14px;"
+            "  border: 1px solid #2a5a3a; border-radius: 4px; padding: 8px;"
+            "}"
+        )
+        self.cw_text_display.setPlaceholderText("Decoded Morse text will appear here…")
+        cw_layout.addWidget(self.cw_text_display, stretch=1)
+        self.tabs.addTab(cw_widget, "CW Decoder")
+
+        # DX Cluster tab — live feed of worldwide ham radio spots
+        dx_widget = QWidget()
+        dx_layout = QVBoxLayout(dx_widget)
+        dx_intro = QLabel(
+            "🌍 DX Cluster — live feed of ham-radio DX spots from a networked cluster.\n"
+            "Each line shows: frequency, spotted station, spotter, comment, Zulu time, age.\n"
+            "Double-click a spot to tune to that frequency."
+        )
+        dx_intro.setWordWrap(True)
+        dx_intro.setStyleSheet("color: #ccc; font-size: 11px; padding: 4px;")
+        dx_layout.addWidget(dx_intro)
+
+        dx_ctrl_row = QHBoxLayout()
+        self.dx_connect_btn = QPushButton("Connect to Cluster")
+        self.dx_connect_btn.setCheckable(True)
+        self.dx_connect_btn.setChecked(self.config.dx_cluster_enabled)
+        self.dx_connect_btn.clicked.connect(self._on_dx_connect_toggled)
+        dx_ctrl_row.addWidget(self.dx_connect_btn)
+        dx_ctrl_row.addStretch(1)
+        self.dx_status_label = QLabel("Disconnected")
+        self.dx_status_label.setStyleSheet("color: #8b96a7; font-family: monospace;")
+        dx_ctrl_row.addWidget(self.dx_status_label)
+        dx_layout.addLayout(dx_ctrl_row)
+
+        # Filter row — show only spots matching a callsign or band
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter:"))
+        self.dx_filter_edit = QLineEdit()
+        self.dx_filter_edit.setPlaceholderText("callsign, band, or mode (e.g. 'FT8', '14025', 'ZL')")
+        self.dx_filter_edit.textChanged.connect(self._refresh_dx_cluster_list)
+        filter_row.addWidget(self.dx_filter_edit, stretch=1)
+        dx_layout.addLayout(filter_row)
+
+        self.dx_list = QListWidget()
+        self.dx_list.itemDoubleClicked.connect(self._on_dx_spot_activated)
+        dx_layout.addWidget(self.dx_list, stretch=1)
+        self.tabs.addTab(dx_widget, "DX Cluster")
+        # Apply saved initial state
+        if self.config.dx_cluster_enabled:
+            QTimer.singleShot(1500, self._dx_auto_connect)
 
         # Settings tab
         set_widget = QWidget()
@@ -670,6 +918,40 @@ class MainWindow(QMainWindow):
 
         set_layout.addRow(gqrx_cfg_box)
 
+        # ---- Magic features settings ----
+        magic_box = QGroupBox("✨ Magic Features")
+        magic_layout = QVBoxLayout(magic_box)
+
+        # Night vision mode — red theme for dark adaptation
+        self.set_night_vision = QCheckBox("Night Vision mode (red theme — preserves dark adaptation)")
+        self.set_night_vision.setChecked(self.config.night_vision)
+        self.set_night_vision.setToolTip(
+            "Switches the entire UI to a deep red theme. Red light preserves night vision,\n"
+            "so ham operators can use Magic SDR in a dark shack without losing dark adaptation.\n"
+            "Takes effect on next app restart (or click Apply below)."
+        )
+        self.set_night_vision.toggled.connect(self._on_night_vision_toggled)
+        magic_layout.addWidget(self.set_night_vision)
+
+        # Auto-start DX cluster on launch
+        self.set_dx_autostart = QCheckBox("Auto-connect to DX cluster on launch")
+        self.set_dx_autostart.setChecked(self.config.dx_cluster_enabled)
+        self.set_dx_autostart.toggled.connect(self._on_settings_changed)
+        magic_layout.addWidget(self.set_dx_autostart)
+
+        # CW decoder auto-enable
+        self.set_cw_enabled = QCheckBox("Enable CW (Morse) decoder")
+        self.set_cw_enabled.setChecked(self.config.cw_decoder_enabled)
+        self.set_cw_enabled.toggled.connect(self._on_settings_changed)
+        magic_layout.addWidget(self.set_cw_enabled)
+
+        # Apply night vision immediately button
+        apply_nv_btn = QPushButton("Apply Night Vision now")
+        apply_nv_btn.clicked.connect(self._apply_night_vision_now)
+        magic_layout.addWidget(apply_nv_btn)
+
+        set_layout.addRow(magic_box)
+
         self.tabs.addTab(set_widget, "Settings")
 
         splitter.addWidget(right)
@@ -732,6 +1014,9 @@ class MainWindow(QMainWindow):
             lambda f, e: self.status.showMessage(f"AI tag failed for {f/1e6:.4f}: {e}", 3000)
         )
 
+        # Time-travel widget mode change → toggle live/replay
+        self.time_travel_widget.mode_changed.connect(self._on_time_travel_mode_changed)
+
     def _apply_config(self) -> None:
         self.dial.set_frequency(self.config.last_frequency_hz)
         self.mod_combo.setCurrentText(self.config.last_modulation)
@@ -744,6 +1029,80 @@ class MainWindow(QMainWindow):
         self.solar_fetcher.start()
         # Trigger initial conditions panel update
         QTimer.singleShot(100, self._update_conditions)
+        QTimer.singleShot(100, self._update_aurora_panel)
+
+        # ---- Load EQ state from config ----
+        if self.config.eq_gains and len(self.config.eq_gains) == len(self.eq_sliders):
+            for i, gain in enumerate(self.config.eq_gains):
+                self.eq_sliders[i].blockSignals(True)
+                self.eq_sliders[i].setValue(int(gain))
+                self.eq_sliders[i].blockSignals(False)
+                self.equalizer.set_band_gain(i, float(gain))
+                # Update the per-band label too
+                lbl = self.findChild(QLabel, f"eq_gain_lbl_{i}")
+                if lbl:
+                    sign = "+" if gain >= 0 else ""
+                    lbl.setText(f"{sign}{int(gain)}")
+        self.eq_enabled_chk.setChecked(self.config.eq_enabled)
+        self.equalizer.set_enabled(self.config.eq_enabled)
+        # Set the preset combo to the saved preset name, or "Custom" if not in the list
+        if self.config.eq_preset_name in [self.eq_preset_combo.itemText(i) for i in range(self.eq_preset_combo.count())]:
+            self.eq_preset_combo.setCurrentText(self.config.eq_preset_name)
+        else:
+            self.eq_preset_combo.setCurrentText("Custom")
+
+        # ---- Load visualizer mode ----
+        if self.config.visualizer_mode in VISUALIZER_MODES:
+            self.viz_mode_combo.setCurrentText(self.config.visualizer_mode)
+            self.audio_visualizer.set_mode(self.config.visualizer_mode)
+
+        # ---- Load memory presets ----
+        from .memory_presets import MemoryPreset
+        presets = []
+        for pd in self.config.memory_presets:
+            if pd and isinstance(pd, dict) and pd.get("freq_hz", 0) > 0:
+                presets.append(MemoryPreset(
+                    freq_hz=pd["freq_hz"],
+                    modulation=pd.get("modulation", ""),
+                    label=pd.get("label", ""),
+                    stored_at=pd.get("stored_at", 0.0),
+                ))
+            else:
+                presets.append(None)
+        self.memory_bar.set_presets(presets)
+
+        # ---- Load DX cluster autostart setting ----
+        self.config.dx_cluster_enabled = self.set_dx_autostart.isChecked()
+        self.config.cw_decoder_enabled = self.set_cw_enabled.isChecked()
+        self.cw_decoder.enabled = self.config.cw_decoder_enabled
+
+    def _save_magic_state(self) -> None:
+        """Persist all the magic-feature state to config."""
+        # EQ gains
+        self.config.eq_gains = [float(s.value()) for s in self.eq_sliders]
+        self.config.eq_enabled = self.eq_enabled_chk.isChecked()
+        self.config.eq_preset_name = self.eq_preset_combo.currentText()
+        # Visualizer mode
+        self.config.visualizer_mode = self.audio_visualizer.mode
+        # Memory presets — serialize to list of dicts
+        serialized = []
+        for p in self.memory_bar.get_presets():
+            if p is None:
+                serialized.append(None)
+            else:
+                serialized.append({
+                    "freq_hz": p.freq_hz,
+                    "modulation": p.modulation,
+                    "label": p.label,
+                    "stored_at": p.stored_at,
+                })
+        self.config.memory_presets = serialized
+        # CW + DX settings
+        self.config.cw_decoder_enabled = self.cw_decoder.enabled
+        self.config.dx_cluster_enabled = self.dx_connect_btn.isChecked()
+        # Night vision
+        self.config.night_vision = self.set_night_vision.isChecked()
+        self.config.save()
 
     # ----------------------------- handlers -----------------------------
     def _on_connect_clicked(self) -> None:
@@ -1067,8 +1426,18 @@ class MainWindow(QMainWindow):
     def _on_audio_chunk(self, chunk: np.ndarray, sample_rate: int, channels: int) -> None:
         # Apply EQ (no-op if disabled or flat — preserves CPU)
         processed = self.equalizer.process(chunk, sample_rate=sample_rate)
-        # Playback
-        self.audio_player.push(processed)
+        # Push to audio visualizer (always — it's a passive consumer)
+        self.audio_visualizer.push_audio(processed, sample_rate, channels)
+        # Push to time-travel buffer (always records the last 30 s of audio)
+        self.time_travel_buffer.push(processed)
+        # Push to CW decoder (only if enabled — saves CPU when not needed)
+        if self.cw_decoder.enabled:
+            self.cw_decoder.process_audio(processed, sample_rate)
+        # Playback — live mode only. In time-travel replay mode, we feed
+        # the player from the buffer at the chosen offset (handled separately
+        # by the replay pump, which we'd need a separate timer for).
+        if not self._time_travel_replaying:
+            self.audio_player.push(processed)
         # Recording (uses processed audio so the EQ affects recordings too)
         if self.recordings.is_recording:
             lvl = self.gqrx.get_signal_level() or -120.0
@@ -1120,15 +1489,290 @@ class MainWindow(QMainWindow):
             self.eq_sliders[band_idx].setToolTip(
                 f"{freq} Hz: {value:+d} dB"
             )
+        # Mark the preset as "Custom" since user has manually adjusted
+        self.eq_preset_combo.blockSignals(True)
+        self.eq_preset_combo.setCurrentText("Custom")
+        self.eq_preset_combo.blockSignals(False)
+        # Find closest preset and show in status bar (silent hint)
+        current_gains = [float(s.value()) for s in self.eq_sliders]
+        closest = find_closest_preset(current_gains)
+        if closest != "Custom":
+            self.status.showMessage(f"EQ near '{closest}' preset", 1500)
+        # Persist
+        self._save_magic_state()
 
     def _on_eq_enabled_toggled(self, enabled: bool) -> None:
         self.equalizer.set_enabled(enabled)
+        self._save_magic_state()
+
+    def _on_eq_preset_selected(self, preset_name: str) -> None:
+        """Called when the user picks a preset from the dropdown."""
+        if preset_name == "Custom":
+            return  # user picked "Custom" — leave sliders alone
+        if preset_name not in EQ_PRESETS:
+            return
+        gains = EQ_PRESETS[preset_name]
+        # Update all sliders + EQ gains
+        for i, gain in enumerate(gains):
+            self.eq_sliders[i].blockSignals(True)
+            self.eq_sliders[i].setValue(int(gain))
+            self.eq_sliders[i].blockSignals(False)
+            self.equalizer.set_band_gain(i, float(gain))
+            lbl = self.findChild(QLabel, f"eq_gain_lbl_{i}")
+            if lbl:
+                sign = "+" if gain >= 0 else ""
+                lbl.setText(f"{sign}{int(gain)}")
+        self.status.showMessage(f"EQ preset: {preset_name}", 2000)
+        self._save_magic_state()
 
     def _on_eq_reset(self) -> None:
-        """Reset all EQ bands to 0 dB."""
+        """Reset all EQ bands to 0 dB (selects 'Flat' preset)."""
         for sld in self.eq_sliders:
             sld.setValue(0)
         self.equalizer.reset()
+        self.eq_preset_combo.blockSignals(True)
+        self.eq_preset_combo.setCurrentText("Flat")
+        self.eq_preset_combo.blockSignals(False)
+        self._save_magic_state()
+
+    # ----------------------------- visualizer -----------------------------
+    def _on_viz_mode_changed(self, mode: str) -> None:
+        self.status.showMessage(f"Visualizer: {mode} (right-click visualizer to cycle)", 2000)
+        self._save_magic_state()
+
+    # ----------------------------- memory presets -----------------------------
+    def _on_memory_tune(self, freq_hz: int, modulation: str) -> None:
+        """User clicked a memory preset — tune to it."""
+        if modulation:
+            self.mod_combo.setCurrentText(modulation)
+        self._tune_to(freq_hz)
+        self.status.showMessage(f"Memory preset: {freq_hz/1e6:.4f} MHz", 2000)
+
+    def _make_memory_preset_from_current(self):
+        """Callback for the memory bar — returns a preset for the current station."""
+        freq = self.config.last_frequency_hz
+        mod = self.config.last_modulation
+        # Try to find a label for this frequency
+        label = lookup_known(freq) or ""
+        if not label:
+            b = self.bookmarks.get(freq)
+            if b:
+                label = b.label
+        if not label:
+            band = band_for_frequency(freq)
+            label = f"{freq/1e6:.4f} MHz" + (f" ({band.name})" if band else "")
+        import time
+        preset = MemoryPreset(
+            freq_hz=freq,
+            modulation=mod,
+            label=label,
+            stored_at=time.time(),
+        )
+        self.status.showMessage(f"Stored → M?  ({freq/1e6:.4f} MHz, {label})", 2500)
+        # Persist after a beat
+        QTimer.singleShot(100, self._save_magic_state)
+        return preset
+
+    # ----------------------------- time-travel -----------------------------
+    def _on_time_travel_mode_changed(self, is_live: bool) -> None:
+        """User moved the time-travel slider between LIVE and REPLAY."""
+        self._time_travel_replaying = not is_live
+        if not is_live:
+            self.status.showMessage("⏮ Time-travel REPLAY mode — drag slider right to return to live", 3000)
+        else:
+            self.status.showMessage("▶ Live audio resumed", 2000)
+
+    # ----------------------------- CW decoder -----------------------------
+    def _on_cw_enabled_toggled(self, enabled: bool) -> None:
+        self.cw_decoder.enabled = enabled
+        self.config.cw_decoder_enabled = enabled
+        self.config.save()
+        if not enabled:
+            self.cw_wpm_label.setText("WPM: —")
+            self.cw_element_label.setText("Current: —")
+
+    def _refresh_cw_panel(self) -> None:
+        """Periodic refresh of the CW decoder text display."""
+        if not self.cw_decoder.enabled:
+            return
+        # WPM
+        wpm = self.cw_decoder.wpm
+        if wpm > 0:
+            self.cw_wpm_label.setText(f"WPM: {wpm:.0f}")
+        # Current element
+        elem = self.cw_decoder._current_morse  # type: ignore[attr-defined]
+        if elem:
+            self.cw_element_label.setText(f"Current: {elem}")
+        else:
+            self.cw_element_label.setText("Current: —")
+        # Decoded text (only update if changed to avoid scrolling flicker)
+        text = self.cw_decoder.decoded_text
+        if text != self.cw_text_display.toPlainText():
+            self.cw_text_display.setPlainText(text)
+            # Scroll to bottom
+            cursor = self.cw_text_display.textCursor()
+            cursor.movePosition(cursor.End)
+            self.cw_text_display.setTextCursor(cursor)
+
+    # ----------------------------- DX cluster -----------------------------
+    def _dx_auto_connect(self) -> None:
+        """Called via QTimer to auto-connect to the cluster on launch."""
+        if self.config.dx_cluster_enabled and not self.dx_cluster.is_connected:
+            self.dx_connect_btn.setChecked(True)
+            self._on_dx_connect_toggled()
+
+    def _on_dx_connect_toggled(self) -> None:
+        if self.dx_connect_btn.isChecked():
+            self.dx_status_label.setText("Connecting…")
+            self.dx_cluster.connection_changed.connect(self._on_dx_connection_changed)
+            self.dx_cluster.spot_received.connect(lambda s: self._refresh_dx_cluster_list())
+            self.dx_cluster.start()
+            self.dx_refresh_timer.start()
+            self.config.dx_cluster_enabled = True
+        else:
+            self.dx_cluster.stop()
+            self.dx_refresh_timer.stop()
+            self.dx_status_label.setText("Disconnected")
+            self.dx_status_label.setStyleSheet("color: #8b96a7; font-family: monospace;")
+            self.config.dx_cluster_enabled = False
+        self.config.save()
+
+    def _on_dx_connection_changed(self, connected: bool, message: str) -> None:
+        if connected:
+            self.dx_status_label.setText(f"✓ {message}")
+            self.dx_status_label.setStyleSheet("color: #5cffaa; font-family: monospace;")
+        else:
+            self.dx_status_label.setText(f"✗ {message}")
+            self.dx_status_label.setStyleSheet("color: #ff8a8a; font-family: monospace;")
+
+    def _refresh_dx_cluster_list(self) -> None:
+        """Re-render the DX cluster spot list, applying the current filter."""
+        filter_text = self.dx_filter_edit.text().strip().upper() if hasattr(self, "dx_filter_edit") else ""
+        spots = self.dx_cluster.get_recent_spots(n=100)
+        # Apply filter
+        if filter_text:
+            filtered = []
+            for s in spots:
+                if (filter_text in s.dx_callsign.upper()
+                        or filter_text in s.spotter.upper()
+                        or filter_text in s.comment.upper()
+                        or filter_text in f"{s.freq_mhz:.3f}"):
+                    filtered.append(s)
+            spots = filtered
+        # Limit to 80 to keep the list fast
+        spots = spots[:80]
+        # Rebuild list (without losing scroll position)
+        self.dx_list.clear()
+        for s in spots:
+            text = s.format()
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, s.freq_hz)
+            # Color-code by age: green for fresh, yellow for old, gray for stale
+            age_s = time.time() - s.received_at
+            if age_s < 60:
+                color = QColor("#5cffaa")
+            elif age_s < 300:
+                color = QColor("#ffd45c")
+            else:
+                color = QColor("#8b96a7")
+            item.setForeground(color)
+            self.dx_list.addItem(item)
+
+    def _on_dx_spot_activated(self, item) -> None:
+        freq = item.data(Qt.UserRole)
+        if freq:
+            self._tune_to(int(freq))
+            self.status.showMessage(f"Tuned to DX spot: {freq/1e6:.3f} kHz", 3000)
+
+    # ----------------------------- auto-surf -----------------------------
+    def _on_auto_surf_clicked(self) -> None:
+        if not self.gqrx.is_connected():
+            self.auto_surf_btn.setChecked(False)
+            QMessageBox.warning(self, "Not connected",
+                                "Connect to Gqrx first, then click ✨ Auto-Surf.")
+            return
+        if self.auto_surfer.is_running:
+            self.auto_surfer.stop()
+            self.auto_surf_btn.setText("✨ Auto-Surf")
+            self.auto_surf_btn.setChecked(False)
+            self.status.showMessage("Auto-Surf stopped", 2000)
+        else:
+            self.auto_surfer.stop_started.connect(self._on_auto_surf_stop_started)
+            self.auto_surfer.surf_progress.connect(self._on_auto_surf_progress)
+            self.auto_surfer.surf_finished.connect(self._on_auto_surf_finished)
+            self.auto_surfer.surf_error.connect(self._on_auto_surf_error)
+            self.auto_surf_btn.setText("■ Stop Auto-Surf")
+            self.auto_surf_btn.setChecked(True)
+            self.status.showMessage("✨ Auto-Surf starting — surfing all bands…", 3000)
+            self.auto_surfer.start(dwell_seconds=5.0)
+
+    def _on_auto_surf_stop_started(self, band_name: str, freq_hz: int, label: str) -> None:
+        self.status.showMessage(
+            f"✨ Auto-Surf: {band_name} → {freq_hz/1e6:.4f} MHz — {label}",
+            5000
+        )
+
+    def _on_auto_surf_progress(self, band_idx: int, total: int) -> None:
+        self.status.showMessage(
+            f"✨ Auto-Surf: band {band_idx + 1}/{total}…",
+            3000
+        )
+
+    def _on_auto_surf_finished(self, stops: list) -> None:
+        self.auto_surf_btn.setText("✨ Auto-Surf")
+        self.auto_surf_btn.setChecked(False)
+        summary_lines = [f"✨ Auto-Surf complete — visited {len(stops)} bands:"]
+        for s in stops:
+            summary_lines.append(f"  • {s.band_name}: {s.freq_hz/1e6:.4f} MHz @ {s.level_db:.0f} dBFS — {s.label or 'Unknown'}")
+        QMessageBox.information(self, "Auto-Surf Complete", "\n".join(summary_lines))
+
+    def _on_auto_surf_error(self, err: str) -> None:
+        self.auto_surf_btn.setText("✨ Auto-Surf")
+        self.auto_surf_btn.setChecked(False)
+        self.status.showMessage(f"Auto-Surf error: {err}", 5000)
+
+    # ----------------------------- aurora -----------------------------
+    def _update_aurora_panel(self) -> None:
+        """Refresh the aurora forecast from the cached solar data."""
+        cond = self.solar_fetcher.get_current()
+        if cond is None:
+            self.aurora_summary_label.setText("Waiting for solar data…")
+            return
+        aurora = forecast_aurora(cond.k_index, self.config.observer_latitude)
+        self.aurora_summary_label.setText(aurora.summary())
+        self.aurora_detail_labels["storm_class"].setText(aurora.storm_class)
+        if aurora.oval_latitude is not None:
+            self.aurora_detail_labels["oval_lat"].setText(f"~{aurora.oval_latitude:.0f}° magnetic latitude")
+        else:
+            self.aurora_detail_labels["oval_lat"].setText("—")
+        if aurora.visible_from_observer:
+            self.aurora_detail_labels["visible"].setText("✓ YES — get outside and look up!")
+            self.aurora_detail_labels["visible"].setStyleSheet("color: #b380ff; font-family: monospace; font-weight: 700;")
+        else:
+            self.aurora_detail_labels["visible"].setText(f"✗ No (need Kp ≥ {int((67 - self.config.observer_latitude) / 2) + 1} from your latitude)")
+            self.aurora_detail_labels["visible"].setStyleSheet("color: #8b96a7; font-family: monospace;")
+        self.aurora_detail_labels["hf_abs"].setText(aurora.hf_absorption)
+        self.aurora_detail_labels["vhf_scatter"].setText(aurora.vhf_scatter)
+
+    # ----------------------------- night vision -----------------------------
+    def _on_night_vision_toggled(self, enabled: bool) -> None:
+        self.config.night_vision = enabled
+        self.config.save()
+
+    def _apply_night_vision_now(self) -> None:
+        """Re-apply the application stylesheet based on night-vision setting."""
+        from PyQt5.QtWidgets import QApplication
+        from .main import DARK_STYLE, NIGHT_VISION_STYLE
+        app = QApplication.instance()
+        if app:
+            if self.config.night_vision:
+                app.setStyleSheet(NIGHT_VISION_STYLE)
+            else:
+                app.setStyleSheet(DARK_STYLE)
+            self.status.showMessage(
+                "Applied " + ("night vision" if self.config.night_vision else "day") + " theme",
+                2000
+            )
 
     # ----------------------------- conditions / RDS update -----------------------------
     def _update_conditions(self) -> None:
@@ -1221,6 +1865,15 @@ class MainWindow(QMainWindow):
         self.gqrx.set_frequency(freq_hz)
         # Reset RDS decoder on tune (different station → different RDS data)
         self.rds_decoder.reset()
+        # Reset CW decoder on tune (different station → different Morse)
+        if self.cw_decoder.enabled:
+            self.cw_decoder.reset()
+        # Reset time-travel buffer on tune (different station → different audio)
+        self.time_travel_buffer.reset()
+        # Force time-travel back to live mode if it was replaying
+        if self._time_travel_replaying:
+            self.time_travel_widget.go_live()
+            self._time_travel_replaying = False
 
     def _on_modulation_changed(self, mod: str) -> None:
         if self.gqrx.is_connected():
@@ -1430,7 +2083,7 @@ class MainWindow(QMainWindow):
                     results.sort(key=lambda x: x[1], reverse=True)
                     top = results[:50]
                     QMetaObject.invokeMethod(self, "_refresh_test_sweep",
-                                              QQt.QueuedConnection,
+                                              Qt.QueuedConnection,
                                               Q_ARG(list, top))
                     self.scan_progress.setValue(int((i + 1) / n_steps * 100))
             finally:
@@ -1594,6 +2247,11 @@ class MainWindow(QMainWindow):
 
     # ----------------------------- shutdown -----------------------------
     def closeEvent(self, event) -> None:
+        # Persist all the magic-feature state before quitting
+        try:
+            self._save_magic_state()
+        except Exception:
+            pass
         try:
             self.config.window_width = self.width()
             self.config.window_height = self.height()
@@ -1627,6 +2285,16 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.clock.stop()
+        except Exception:
+            pass
+        # Stop new magical-feature components
+        try:
+            self.dx_cluster.stop()
+        except Exception:
+            pass
+        try:
+            if self.auto_surfer.is_running:
+                self.auto_surfer.stop()
         except Exception:
             pass
         super().closeEvent(event)
