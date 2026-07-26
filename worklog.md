@@ -475,3 +475,26 @@ Stage Summary:
 - Visibility: public
 - .env excluded from VCS; all source code (magic_sdr/), scripts/, web/, docs, bookmarks, config pushed
 - Remote URL sanitized to remove embedded token
+
+---
+Task ID: ui-clip-fix
+Agent: main
+Task: Fix bottom of app window being clipped — memory presets too big, visualizer too big
+
+Work Log:
+- Inspected main_window.py layout: root VBox > [top_bar, memory_bar, diag_banner, splitter(left | right)]
+- Left panel had no scroll area, so EQ + Time-Travel got clipped on short windows
+- Memory preset buttons: setMinimumHeight 54->40, setMinimumWidth 96->72, padding 6->3, font 10->9, grid spacing 3->2, caption padding 2px->0px
+- Audio visualizer: setMinimumSize (280,180)->(240,110); viz_container setFixedHeight 180->120
+- Wrapped left panel in QScrollArea (widgetResizable, no frame, h-scrollbar off, min width 420) so bottom controls scroll on short windows
+- Set MainWindow minimum size to 900x640 so right panel (waterfall + visualizer + tabs) can't collapse
+- Syntax-checked all 3 edited files; ran scripts/check_imports.py — all modules import cleanly
+- Rebuilt download/magic_sdr_player.zip (162K)
+- Committed and pushed to GitHub (commit 44135db)
+
+Stage Summary:
+- Total vertical space saved on left panel: ~60px (memory bar) before scrolling kicks in
+- Total vertical space saved on right panel: ~60px (visualizer)
+- Left panel now scrolls if window is too short — no more clipped EQ/Time-Travel
+- Window won't resize below 900x640
+- Changes live on GitHub main branch
