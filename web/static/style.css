@@ -1,0 +1,241 @@
+/* Magic SDR Player — remote web UI styles */
+:root {
+  --bg: #0b0f14;
+  --bg-elev: #131922;
+  --bg-card: #1a2230;
+  --border: #2a3447;
+  --text: #e6ecf3;
+  --text-dim: #8b96a7;
+  --accent: #5cd9ff;
+  --accent-2: #ff5c8a;
+  --danger: #ff5c5c;
+  --ok: #5cffaa;
+  --warning: #ffd45c;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  background: linear-gradient(180deg, #161d2a 0%, #0e131b 100%);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand { display: flex; align-items: center; gap: 12px; }
+.brand .logo {
+  font-size: 28px;
+  color: var(--accent);
+  filter: drop-shadow(0 0 8px var(--accent));
+}
+.brand h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.3px; }
+.brand .subtitle { font-size: 11px; color: var(--text-dim); }
+
+.connection { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-dim); }
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot-on  { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.dot-off { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+
+main {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  grid-template-areas:
+    "tuner tuner"
+    "waterfall bookmarks"
+    "scanner recordings";
+  gap: 12px;
+  padding: 12px;
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+@media (max-width: 900px) {
+  main {
+    grid-template-columns: 1fr;
+    grid-template-areas: "tuner" "waterfall" "bookmarks" "scanner" "recordings";
+  }
+}
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+}
+.tuner-card { grid-area: tuner; }
+.waterfall-card { grid-area: waterfall; }
+.bookmarks-card { grid-area: bookmarks; }
+.scanner-card { grid-area: scanner; }
+.recordings-card { grid-area: recordings; }
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.card-header h2 { margin: 0; font-size: 14px; font-weight: 600; color: var(--text); }
+.hint { font-size: 11px; color: var(--text-dim); }
+
+/* Tuner */
+.freq-display {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  margin-bottom: 8px;
+}
+.freq-main {
+  font-family: "SF Mono", "JetBrains Mono", "Roboto Mono", monospace;
+  font-size: 48px;
+  font-weight: 300;
+  color: var(--accent);
+  text-shadow: 0 0 20px rgba(92, 217, 255, 0.3);
+}
+.freq-unit { font-size: 18px; color: var(--text-dim); margin-left: 6px; }
+.freq-label { font-size: 12px; color: var(--text-dim); }
+
+.signal-bar {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+}
+.signal-meter {
+  flex: 1; height: 8px; background: #0a0e14;
+  border: 1px solid var(--border); border-radius: 4px;
+  overflow: hidden; position: relative;
+}
+.signal-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, var(--ok) 0%, var(--warning) 60%, var(--danger) 100%);
+  transition: width 0.15s ease-out;
+}
+.signal-text { font-family: monospace; font-size: 12px; min-width: 70px; text-align: right; }
+
+.tuner-controls {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+}
+.tune-btn {
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-family: monospace;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.tune-btn:hover { background: var(--accent); color: var(--bg); }
+#freq-input {
+  background: var(--bg-elev); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px; font-family: monospace; font-size: 12px;
+  width: 110px; text-align: center;
+}
+
+.modulation-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px;
+}
+.modulation-row label { color: var(--text-dim); }
+.modulation-row select, .modulation-row input[type="range"] {
+  background: var(--bg-elev); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 8px; font-size: 12px;
+}
+.modulation-row .vol-label { margin-left: 8px; }
+.mute-btn, .record-btn {
+  background: var(--bg-elev); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 10px; cursor: pointer; font-size: 12px;
+}
+.record-btn { color: var(--danger); border-color: var(--danger); }
+.record-btn.recording { background: var(--danger); color: var(--bg); }
+
+/* Waterfall */
+#waterfall {
+  width: 100%; height: 320px;
+  background: #000;
+  border-radius: 6px;
+  display: block;
+}
+
+/* Bookmarks / lists */
+.band-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+.band-tab, .scan-btn {
+  background: var(--bg-elev); color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 8px; font-size: 11px; cursor: pointer;
+  transition: all 0.15s;
+}
+.band-tab.active, .scan-btn:hover {
+  background: var(--accent); color: var(--bg); border-color: var(--accent);
+}
+.scan-btn.scan-all { background: var(--accent-2); color: var(--bg); border-color: var(--accent-2); }
+
+.bookmark-list, .discovered-list, .recording-list {
+  list-style: none; padding: 0; margin: 0;
+  max-height: 280px; overflow-y: auto;
+}
+.bookmark-list li, .discovered-list li, .recording-list li {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  display: flex; flex-direction: column; gap: 2px;
+  transition: background 0.1s;
+}
+.bookmark-list li:hover, .discovered-list li:hover, .recording-list li:hover {
+  background: var(--bg-elev);
+}
+.bm-freq { font-family: monospace; color: var(--accent); font-size: 13px; }
+.bm-label { color: var(--text); font-size: 13px; }
+.bm-meta { color: var(--text-dim); font-size: 11px; }
+.bm-ai-tag { color: var(--warning); font-size: 11px; }
+
+.scan-progress {
+  display: flex; align-items: center; gap: 8px; margin: 8px 0;
+}
+.progress-bar {
+  flex: 1; height: 6px; background: #0a0e14;
+  border-radius: 3px; overflow: hidden; border: 1px solid var(--border);
+}
+.progress-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 0.3s;
+}
+#scan-status { font-size: 11px; color: var(--text-dim); min-width: 100px; text-align: right; }
+
+.ghost-btn {
+  background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 8px; cursor: pointer; font-size: 11px;
+}
+.ghost-btn:hover { color: var(--text); border-color: var(--accent); }
+.ghost-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+#bookmark-search {
+  background: var(--bg-elev); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 8px; font-size: 12px; width: 140px;
+}
+
+.audio-hint {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+  background: rgba(92, 217, 255, 0.1); border: 1px solid var(--accent);
+  color: var(--accent); padding: 8px 16px; border-radius: 6px;
+  font-size: 12px; cursor: pointer; z-index: 100;
+  transition: opacity 0.3s;
+}
+.audio-hint.hidden { opacity: 0; pointer-events: none; }

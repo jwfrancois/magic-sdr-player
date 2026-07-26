@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Magic SDR Player</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">✦</span>
+      <div>
+        <h1>Magic SDR Player</h1>
+        <div class="subtitle">Remote SDR · powered by Gqrx + RTL-SDR V3</div>
+      </div>
+    </div>
+    <div class="connection">
+      <span id="conn-status" class="dot dot-off"></span>
+      <span id="conn-text">Connecting…</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Frequency + signal info -->
+    <section class="card tuner-card">
+      <div class="freq-display">
+        <div class="freq-main">
+          <span id="freq-value">96.900000</span>
+          <span class="freq-unit">MHz</span>
+        </div>
+        <div class="freq-label" id="freq-label">FM Broadcast</div>
+      </div>
+      <div class="signal-bar">
+        <div class="signal-meter">
+          <div class="signal-fill" id="signal-fill"></div>
+        </div>
+        <div class="signal-text">
+          <span id="signal-db">— dB</span>
+        </div>
+      </div>
+      <div class="tuner-controls">
+        <button class="tune-btn" data-step="-100000">−100k</button>
+        <button class="tune-btn" data-step="-10000">−10k</button>
+        <button class="tune-btn" data-step="-1000">−1k</button>
+        <input type="number" id="freq-input" placeholder="MHz" step="0.001" min="0.5" max="1700">
+        <button class="tune-btn" data-step="1000">+1k</button>
+        <button class="tune-btn" data-step="10000">+10k</button>
+        <button class="tune-btn" data-step="100000">+100k</button>
+      </div>
+      <div class="modulation-row">
+        <label>Modulation:</label>
+        <select id="modulation">
+          <option value="WFM_ST">WFM Stereo</option>
+          <option value="WFM">WFM Mono</option>
+          <option value="FM">NBFM</option>
+          <option value="AM">AM</option>
+          <option value="USB">USB</option>
+          <option value="LSB">LSB</option>
+          <option value="CWU">CWU</option>
+          <option value="CWL">CWL</option>
+        </select>
+        <label class="vol-label">Vol:</label>
+        <input type="range" id="volume" min="0" max="100" value="80">
+        <button id="mute-btn" class="mute-btn">🔊</button>
+        <button id="record-btn" class="record-btn">● Rec</button>
+      </div>
+    </section>
+
+    <!-- Spectrum + waterfall -->
+    <section class="card waterfall-card">
+      <div class="card-header">
+        <h2>Spectrum</h2>
+        <span class="hint" id="spectrum-hint">Waiting for spectrum stream…</span>
+      </div>
+      <canvas id="waterfall" width="1024" height="320"></canvas>
+    </section>
+
+    <!-- Bookmarks + scanner + AI -->
+    <section class="card bookmarks-card">
+      <div class="card-header">
+        <h2>Bookmarks</h2>
+        <input type="text" id="bookmark-search" placeholder="Search…">
+      </div>
+      <div class="band-tabs" id="band-tabs">
+        <button class="band-tab active" data-band="all">All</button>
+        {% for b in bands %}
+        <button class="band-tab" data-band="{{ b }}">{{ b }}</button>
+        {% endfor %}
+      </div>
+      <ul class="bookmark-list" id="bookmark-list"></ul>
+    </section>
+
+    <section class="card scanner-card">
+      <div class="card-header">
+        <h2>Auto-Discovery Scanner</h2>
+        <button id="scan-stop-btn" class="ghost-btn" disabled>Stop</button>
+      </div>
+      <div class="band-tabs" id="scan-band-tabs">
+        {% for b in bands %}
+        <button class="scan-btn" data-band="{{ b }}">Scan {{ b }}</button>
+        {% endfor %}
+        <button class="scan-btn scan-all" data-band="all">Scan All Bands</button>
+      </div>
+      <div class="scan-progress">
+        <div class="progress-bar"><div class="progress-fill" id="scan-progress"></div></div>
+        <span id="scan-status">Idle</span>
+      </div>
+      <ul class="discovered-list" id="discovered-list"></ul>
+    </section>
+
+    <section class="card recordings-card">
+      <div class="card-header">
+        <h2>Recent Recordings</h2>
+        <button id="refresh-recordings" class="ghost-btn">⟳</button>
+      </div>
+      <ul class="recording-list" id="recording-list"></ul>
+    </section>
+  </main>
+
+  <!-- Audio player hint -->
+  <div class="audio-hint" id="audio-hint">
+    Click anywhere to enable audio playback.
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

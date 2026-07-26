@@ -1,0 +1,9 @@
+PyQt5>=5.15
+pyqtgraph>=0.13
+sounddevice>=0.4
+numpy>=1.24
+fastapi>=0.110
+uvicorn>=0.27
+jinja2>=3.1
+aiofiles>=23.0
+matplotlib>=3.7
