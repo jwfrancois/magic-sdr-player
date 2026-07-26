@@ -35,8 +35,15 @@ class Config:
     audio_channels: int = 2                 # Gqrx streams stereo for WFM_ST
 
     # Scanner
-    scan_threshold_db: float = -45.0        # signal level above which a frequency is considered "active"
-    scan_dwell_s: float = 0.25              # time to settle on each frequency while scanning
+    # Gqrx's `l STRENGTH` returns dBFS (decibels relative to full scale),
+    # not dBm. Typical values:
+    #   -30 to -50 dBFS: very strong local FM broadcast
+    #   -50 to -65 dBFS: normal FM station, ATC, NOAA
+    #   -65 to -80 dBFS: weak but audible stations
+    #   -80 to -120 dBFS: noise floor
+    # So -80 dB is a good "is there a signal here?" cutoff.
+    scan_threshold_db: float = -80.0
+    scan_dwell_s: float = 0.5              # time to settle on each frequency while scanning
 
     # Web access
     remote_access_enabled: bool = True      # launch the embedded web server

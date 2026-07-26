@@ -11,6 +11,21 @@ For each active frequency found, it:
 
 Runs in a background thread so the GUI stays responsive. Emits Qt signals
 as it discovers stations and when the scan completes.
+
+IMPORTANT — understanding Gqrx's signal level values:
+  Gqrx's `l STRENGTH` command returns dBFS (decibels relative to full scale),
+  NOT dBm. This is a unitless ratio where 0 dBFS = full ADC scale.
+
+  Typical values you'll see:
+    -30 to -50 dBFS: very strong local FM broadcast (or AGC limiting)
+    -50 to -65 dBFS: normal FM station, ATC, NOAA
+    -65 to -80 dBFS: weak but audible stations
+    -80 to -120 dBFS: noise floor / no signal
+
+  The default threshold of -80 dB will catch anything above the noise floor.
+  If you get 0 stations, your threshold is too strict (or there's no antenna,
+  or Gqrx's gain is too low). Use the `calibrate_noise_floor()` method to
+  measure the local noise floor and set threshold accordingly.
 """
 
 from __future__ import annotations
@@ -61,9 +76,11 @@ class BandScanner(QObject):
     scan_started = pyqtSignal(str)            # band name
     scan_progress = pyqtSignal(float)         # 0..1
     scan_progress_freq = pyqtSignal(int)      # current freq being checked
+    scan_progress_level = pyqtSignal(int, float)  # freq_hz, level_db (for live diagnostic)
     station_found = pyqtSignal(object)        # DiscoveredStation
     scan_finished = pyqtSignal(str, list)     # band name, list[DiscoveredStation]
     scan_error = pyqtSignal(str)
+    noise_floor_calibrated = pyqtSignal(float)  # measured noise floor dBFS
 
     def __init__(self, gqrx: GqrxClient, parent=None):
         super().__init__(parent)
@@ -71,9 +88,21 @@ class BandScanner(QObject):
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._running = False
-        self.threshold_db = -45.0
-        self.dwell_s = 0.25
+        # -80 dBFS catches everything above noise floor; adjust if too noisy.
+        self.threshold_db = -80.0
+        self.dwell_s = 0.5
         self.ai_tagger = None  # injected later, optional
+        # When True, auto-calibrate the noise floor before each scan and set
+        # the threshold to noise_floor + 10 dB. Helps a lot when the user
+        # hasn't tuned the threshold manually.
+        self.auto_threshold = True
+        self._measured_noise_floor: Optional[float] = None
+        # Min signal delta above noise floor to count as a station
+        self.auto_threshold_margin_db = 10.0
+
+    @property
+    def measured_noise_floor(self) -> Optional[float]:
+        return self._measured_noise_floor
 
     def is_running(self) -> bool:
         return self._running
@@ -109,6 +138,52 @@ class BandScanner(QObject):
         self._thread.start()
         return True
 
+    def calibrate_noise_floor(self, band: Optional[Band] = None,
+                              n_samples: int = 10) -> Optional[float]:
+        """Measure the noise floor in (or near) the given band.
+
+        Picks `n_samples` frequencies evenly spaced across the band, tunes to
+        each, reads the signal level, and returns the median. This becomes
+        the baseline; stations must be `auto_threshold_margin_db` above it.
+
+        Returns the measured noise floor in dBFS, or None on failure.
+        """
+        if not self.gqrx.is_connected():
+            return None
+        if band is None:
+            # Default to FM broadcast band (88–108 MHz)
+            band = BANDS_BY_NAME.get("FM Broadcast") or BANDS[0]
+        try:
+            self.gqrx.set_modulation(band.modulation)
+            time.sleep(0.1)
+            start_hz = int(band.start_mhz * 1e6)
+            end_hz = int(band.end_mhz * 1e6)
+            if n_samples < 2:
+                n_samples = 2
+            step = (end_hz - start_hz) // (n_samples - 1) if n_samples > 1 else 0
+            levels: List[float] = []
+            for i in range(n_samples):
+                if self._stop.is_set():
+                    break
+                f = start_hz + i * step
+                if not self.gqrx.set_frequency(f):
+                    continue
+                time.sleep(max(0.2, self.dwell_s * 0.6))
+                lvl = self.gqrx.get_signal_level()
+                if lvl is not None:
+                    levels.append(lvl)
+            if not levels:
+                return None
+            levels.sort()
+            median = levels[len(levels) // 2]
+            self._measured_noise_floor = median
+            log.info("Noise floor calibrated: %.1f dBFS (from %d samples)", median, len(levels))
+            self.noise_floor_calibrated.emit(median)
+            return median
+        except Exception as e:
+            log.warning("Noise floor calibration failed: %s", e)
+            return None
+
     def _scan_all_loop(self) -> None:
         for band in BANDS:
             if self._stop.is_set():
@@ -126,6 +201,17 @@ class BandScanner(QObject):
             if not self.gqrx.is_connected():
                 self.scan_error.emit("Gqrx not connected")
                 return
+
+            # Auto-calibrate noise floor if enabled — this is the key fix
+            # for "0 stations found" when the user's threshold is wrong.
+            effective_threshold = self.threshold_db
+            if self.auto_threshold:
+                nf = self.calibrate_noise_floor(band)
+                if nf is not None:
+                    effective_threshold = nf + self.auto_threshold_margin_db
+                    log.info("Auto threshold for %s: %.1f dBFS (noise %.1f + margin %.1f)",
+                             band.name, effective_threshold, nf, self.auto_threshold_margin_db)
+
             start_hz = int(band.start_mhz * 1e6)
             end_hz = int(band.end_mhz * 1e6)
             step_hz = int(band.step_khz * 1e3)
@@ -144,7 +230,10 @@ class BandScanner(QObject):
                 lvl = self.gqrx.get_signal_level()
                 if lvl is None:
                     continue
-                if lvl >= self.threshold_db:
+                # Always emit level for live diagnostic — useful even if
+                # nothing exceeds threshold, you can see what's coming in.
+                self.scan_progress_level.emit(f, lvl)
+                if lvl >= effective_threshold:
                     st = DiscoveredStation(freq_hz=f, level_db=lvl, band=band,
                                            modulation=band.modulation)
                     # Optionally AI-tag

@@ -297,10 +297,25 @@ class MainWindow(QMainWindow):
         scan_start_btn = QPushButton("▶ Scan")
         scan_start_btn.clicked.connect(self._on_scan_start)
         scan_band_row.addWidget(scan_start_btn)
+        # New: Test sweep button — scans but reports EVERY frequency's level,
+        # regardless of threshold. Great for diagnosing "0 stations found".
+        test_sweep_btn = QPushButton("🔬 Test Sweep")
+        test_sweep_btn.setToolTip("Sweep the band and show signal level at every frequency, "
+                                  "regardless of threshold. Use this to diagnose if the scanner "
+                                  "is seeing any signal at all.")
+        test_sweep_btn.clicked.connect(self._on_test_sweep)
+        scan_band_row.addWidget(test_sweep_btn)
         scan_stop_btn = QPushButton("■ Stop")
         scan_stop_btn.clicked.connect(lambda: self.scanner.stop())
         scan_band_row.addWidget(scan_stop_btn)
         scan_layout.addLayout(scan_band_row)
+
+        # Live level readout — shows the current frequency being sampled and
+        # its signal level, so you can see what the scanner is "hearing".
+        self.scan_live_label = QLabel("Live: idle")
+        self.scan_live_label.setStyleSheet("color: #5cd9ff; font-family: monospace; padding: 2px;")
+        scan_layout.addWidget(self.scan_live_label)
+
         self.scan_progress = QProgressBar()
         scan_layout.addWidget(self.scan_progress)
         self.scan_status = QLabel("Idle")
@@ -308,6 +323,13 @@ class MainWindow(QMainWindow):
         self.discovered_list = QListWidget()
         self.discovered_list.itemDoubleClicked.connect(self._on_discovered_activated)
         scan_layout.addWidget(self.discovered_list, stretch=1)
+
+        # Test-sweep results list — shows every frequency's level
+        self.test_sweep_list = QListWidget()
+        self.test_sweep_list.itemDoubleClicked.connect(self._on_discovered_activated)
+        scan_layout.addWidget(QLabel("Test sweep results (all frequencies sampled):"))
+        scan_layout.addWidget(self.test_sweep_list, stretch=1)
+
         self.tabs.addTab(scan_widget, "Auto-Discover")
 
         # Recordings tab
@@ -328,7 +350,40 @@ class MainWindow(QMainWindow):
         self.set_threshold.setValue(self.config.scan_threshold_db)
         self.set_threshold.setSuffix(" dB")
         self.set_threshold.valueChanged.connect(self._on_settings_changed)
+        self.set_threshold.setToolTip(
+            "Signal level (in dBFS) above which a frequency is considered a station.\n\n"
+            "Gqrx reports dBFS, not dBm. Typical values:\n"
+            "  -30 to -50: very strong local FM\n"
+            "  -50 to -65: normal stations\n"
+            "  -65 to -80: weak but audible\n"
+            "  -80 to -120: noise floor\n\n"
+            "If 'Auto threshold' is on, this value is overridden by noise_floor + margin."
+        )
         set_layout.addRow("Scan threshold:", self.set_threshold)
+
+        # Auto-threshold toggle — when on, scanner measures noise floor at the
+        # start of each scan and uses noise_floor + margin as the threshold.
+        # This is the fix for "0 stations found".
+        self.set_auto_threshold = QCheckBox("Auto-calibrate threshold from noise floor")
+        self.set_auto_threshold.setChecked(True)
+        self.set_auto_threshold.setToolTip(
+            "Before each scan, samples 10 frequencies across the band to measure the "
+            "local noise floor, then sets the threshold to noise_floor + margin.\n\n"
+            "Strongly recommended — fixes the common '0 stations found' issue when "
+            "the threshold doesn't match your antenna/gain conditions."
+        )
+        self.set_auto_threshold.toggled.connect(self._on_settings_changed)
+        set_layout.addRow(self.set_auto_threshold)
+
+        self.set_margin = QDoubleSpinBox()
+        self.set_margin.setRange(0, 40)
+        self.set_margin.setSingleStep(1.0)
+        self.set_margin.setValue(10.0)
+        self.set_margin.setSuffix(" dB")
+        self.set_margin.setToolTip("How many dB above the measured noise floor a signal must be to count as a station.")
+        self.set_margin.valueChanged.connect(self._on_settings_changed)
+        set_layout.addRow("Auto threshold margin:", self.set_margin)
+
         self.set_dwell = QDoubleSpinBox()
         self.set_dwell.setRange(0.05, 5.0)
         self.set_dwell.setSingleStep(0.05)
@@ -374,9 +429,12 @@ class MainWindow(QMainWindow):
         self.scanner.scan_progress_freq.connect(
             lambda f: self.scan_status.setText(f"Scanning: {f/1e6:.4f} MHz")
         )
+        # Live level readout — shows what the scanner is hearing in real time
+        self.scanner.scan_progress_level.connect(self._on_scan_progress_level)
         self.scanner.station_found.connect(self._on_station_found)
         self.scanner.scan_finished.connect(self._on_scan_finished)
         self.scanner.scan_error.connect(self._on_scan_error)
+        self.scanner.noise_floor_calibrated.connect(self._on_noise_floor_calibrated)
 
         # Recordings
         self.recordings.recording_started.connect(self._on_recording_started)
@@ -632,10 +690,93 @@ class MainWindow(QMainWindow):
     # ----------------------------- scanner -----------------------------
     def _on_scan_start(self) -> None:
         band_name = self.scan_band_combo.currentText()
+        # Clear test-sweep results when starting a real scan
+        self.test_sweep_list.clear()
         if band_name == "ALL BANDS":
             self.scanner.scan_all_bands()
         else:
             self.scanner.scan_band_by_name(band_name)
+
+    def _on_test_sweep(self) -> None:
+        """Diagnostic sweep: samples every frequency and shows ALL levels,
+        regardless of threshold. Use this to figure out why 'Scan' returns 0.
+        """
+        if not self.gqrx.is_connected():
+            QMessageBox.warning(self, "Not connected",
+                                "Connect to Gqrx first, then run Test Sweep.")
+            return
+        if self.scanner.is_running():
+            self.scanner.stop()
+            return
+        band_name = self.scan_band_combo.currentText()
+        if band_name == "ALL BANDS":
+            band_name = "FM Broadcast"  # test sweep is single-band only
+        band = BANDS_BY_NAME.get(band_name)
+        if not band:
+            return
+        # Run in a thread so the UI stays responsive
+        import threading
+        self.test_sweep_list.clear()
+        self.scan_status.setText(f"Test sweeping {band.name}…")
+        self.scan_progress.setValue(0)
+
+        def sweep():
+            start_hz = int(band.start_mhz * 1e6)
+            end_hz = int(band.end_mhz * 1e6)
+            step_hz = int(band.step_khz * 1e3)
+            n_steps = max(1, (end_hz - start_hz) // step_hz + 1)
+            self.gqrx.set_modulation(band.modulation)
+            time.sleep(0.1)
+            results = []
+            for i, f in enumerate(range(start_hz, end_hz + 1, step_hz)):
+                if self.scanner._stop.is_set():
+                    break
+                self.gqrx.set_frequency(f)
+                time.sleep(self.scanner.dwell_s)
+                lvl = self.gqrx.get_signal_level()
+                if lvl is None:
+                    continue
+                results.append((f, lvl))
+                # Update progress UI (thread-safe via QMetaObject)
+                from PyQt5.QtCore import QMetaObject, Qt as QQt, Q_ARG
+                # Sort results and show top 50 strongest
+                results.sort(key=lambda x: x[1], reverse=True)
+                top = results[:50]
+                QMetaObject.invokeMethod(self, "_refresh_test_sweep",
+                                          QQt.QueuedConnection,
+                                          Q_ARG(list, top))
+                self.scan_progress.setValue(int((i + 1) / n_steps * 100))
+            self.scan_status.setText(
+                f"Test sweep done — {len(results)} freqs sampled. "
+                f"Strongest: {results[0][0]/1e6:.4f} MHz @ {results[0][1]:.1f} dBFS"
+                if results else "Test sweep done — no signal sampled (check antenna + gain)"
+            )
+
+        threading.Thread(target=sweep, daemon=True, name="TestSweep").start()
+
+    # Slot invoked from the sweep thread to update the test-sweep list
+    from PyQt5.QtCore import pyqtSlot
+    @pyqtSlot(list)
+    def _refresh_test_sweep(self, top_results: list) -> None:
+        self.test_sweep_list.clear()
+        for f, lvl in top_results:
+            # Color-code: green for strong, yellow for medium, dim for weak
+            if lvl > -50:
+                color = "#5cffaa"
+                tag = "STRONG"
+            elif lvl > -65:
+                color = "#ffd45c"
+                tag = "medium"
+            elif lvl > -80:
+                color = "#8b96a7"
+                tag = "weak"
+            else:
+                color = "#4a5266"
+                tag = "noise"
+            item = QListWidgetItem(f"{f/1e6:.4f} MHz · {lvl:.1f} dBFS · {tag}")
+            item.setForeground(QColor(color))
+            item.setData(Qt.UserRole, f)
+            self.test_sweep_list.addItem(item)
 
     def _on_scan_started(self, band_name: str) -> None:
         self.scan_status.setText(f"Scanning {band_name}…")
@@ -644,6 +785,22 @@ class MainWindow(QMainWindow):
 
     def _on_scan_progress(self, p: float) -> None:
         self.scan_progress.setValue(int(p * 100))
+
+    def _on_scan_progress_level(self, freq_hz: int, level_db: float) -> None:
+        """Live update of what the scanner is currently hearing."""
+        self.scan_live_label.setText(
+            f"Live: {freq_hz/1e6:.4f} MHz → {level_db:.1f} dBFS  "
+            f"(threshold: {self.scanner.threshold_db:.0f} dBFS)"
+        )
+
+    def _on_noise_floor_calibrated(self, nf: float) -> None:
+        self.scan_live_label.setText(
+            f"Noise floor calibrated: {nf:.1f} dBFS → threshold = {nf + self.scanner.auto_threshold_margin_db:.1f} dBFS"
+        )
+        self.status.showMessage(
+            f"Noise floor: {nf:.1f} dBFS; threshold set to {nf + self.scanner.auto_threshold_margin_db:.1f} dBFS",
+            4000
+        )
 
     def _on_station_found(self, st: DiscoveredStation) -> None:
         text = f"{st.freq_hz/1e6:.4f} MHz · {st.level_db:.1f} dB · {st.label or 'Unknown'}"
@@ -659,8 +816,18 @@ class MainWindow(QMainWindow):
         self._refresh_bookmarks()
 
     def _on_scan_finished(self, band_name: str, found: list) -> None:
-        self.scan_status.setText(f"Done — {len(found)} stations in {band_name}")
+        nf_str = ""
+        if self.scanner.measured_noise_floor is not None:
+            nf_str = f" (noise floor: {self.scanner.measured_noise_floor:.1f} dBFS)"
+        self.scan_status.setText(
+            f"Done — {len(found)} stations in {band_name}{nf_str}"
+        )
         self.scan_progress.setValue(100)
+        if len(found) == 0:
+            self.scan_live_label.setText(
+                "0 stations found — try 🔬 Test Sweep to see all signal levels, "
+                "or check your antenna / Gqrx gain settings."
+            )
 
     def _on_scan_error(self, err: str) -> None:
         self.scan_status.setText(f"Error: {err}")
@@ -700,6 +867,9 @@ class MainWindow(QMainWindow):
         self.config.scan_dwell_s = self.set_dwell.value()
         self.scanner.threshold_db = self.config.scan_threshold_db
         self.scanner.dwell_s = self.config.scan_dwell_s
+        # Auto-threshold settings (the fix for "0 stations found")
+        self.scanner.auto_threshold = self.set_auto_threshold.isChecked()
+        self.scanner.auto_threshold_margin_db = self.set_margin.value()
         self.config.ai_tagging_enabled = self.set_ai.isChecked()
         self.ai_tagger.enabled = self.config.ai_tagging_enabled
         self.scanner.ai_tagger = self.ai_tagger if self.ai_tagger.enabled else None
