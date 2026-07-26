@@ -88,6 +88,43 @@ else
     $PY -m pip install -r requirements.txt
 fi
 
+# --- Verify all critical imports actually work ---
+echo ""
+echo "Verifying Python imports…"
+MISSING=()
+for pkg in PyQt5 pyqtgraph sounddevice fastapi uvicorn jinja2 aiofiles numpy matplotlib; do
+    if $PY -c "import $pkg" 2>/dev/null; then
+        echo "  OK  $pkg"
+    else
+        echo "  MISSING  $pkg"
+        MISSING+=($pkg)
+    fi
+done
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo ""
+    echo "⚠ The following packages failed to import: ${MISSING[*]}"
+    echo "  Attempting to install them explicitly…"
+    $PY -m pip install ${USE_SYSTEM_PY:+--break-system-packages} "${MISSING[@]}"
+    # Re-verify
+    STILL_MISSING=()
+    for pkg in "${MISSING[@]}"; do
+        if $PY -c "import $pkg" 2>/dev/null; then
+            echo "  OK  $pkg (after retry)"
+        else
+            echo "  STILL MISSING  $pkg"
+            STILL_MISSING+=($pkg)
+        fi
+    done
+    if [ ${#STILL_MISSING[@]} -gt 0 ]; then
+        echo ""
+        echo "ERROR: Could not install: ${STILL_MISSING[*]}"
+        echo "Please install them manually with:"
+        echo "  $PY -m pip install ${STILL_MISSING[*]}"
+        exit 1
+    fi
+fi
+
 # --- Node packages for AI helper ---
 if command -v npm >/dev/null; then
     echo ""
