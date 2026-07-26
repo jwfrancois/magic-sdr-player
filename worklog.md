@@ -177,3 +177,125 @@ Stage Summary:
 - All messaging (TCP failure, banner, diagnose, README, QUICKSTART) consistently
   points to the auto-config as the fastest path.
 - The "Spectrum UDP stream" myth is fully eliminated from all user-facing docs.
+
+---
+Task ID: feature-add-5
+Agent: Super Z (main)
+Task: User requested 8 new features:
+  1. UTC and Regular time display
+  2. Solar conditions
+  3. Band conditions
+  4. HD Radio and RDS
+  5. Main tuning knob
+  6. Analog Receiver meter (S-meter)
+  7. HiFi EQ
+  8. Baltimore, Maryland AM FM radio station presets
+
+Work Log:
+- Created magic_sdr/clock.py — ClockWidget shows UTC + Local time + date,
+  updates every second via QTimer, displayed at top of main window.
+- Created magic_sdr/tuning_knob.py — TuningKnob custom QWidget. Drag up/down
+  to tune by step (default 10 kHz). Mouse wheel for fine tune. Right-click
+  cycles step size (1 Hz / 10 Hz / 100 Hz / 1 kHz / 10 kHz / 100 kHz / 1 MHz).
+  Double-click resets knob position. Drawn with QPainter (metallic knob +
+  blue indicator pointer + tick marks + step label).
+- Created magic_sdr/s_meter.py — SMeterWidget custom QWidget. Classic
+  needle-style S-meter (S1 to S9+40 dB). Curved colored arc band
+  (gray/green/yellow/red zones). Needle smoothly animates toward target
+  with lerp (settles in ~0.3s for mechanical feel). dBFS-to-S-unit
+  mapping: S9 ≈ -40 dBFS, each S-unit ≈ 6 dB.
+- Created magic_sdr/equalizer.py — 10-band HiFi EQ using RBJ biquad peaking
+  filters (scipy.signal.lfilter). Bands: 31, 62, 125, 250, 500, 1k, 2k, 4k,
+  8k, 16k Hz. Gains clamped to ±20 dB. Filter state carried between chunks
+  via lfilter's zi parameter (initialized to zeros, not lfilter_zi, because
+  lfilter_zi is for DC step inputs not zero-centered audio). Pass-through
+  when flat (no CPU). Graceful degradation if scipy unavailable.
+- Created magic_sdr/solar.py — SolarFetcher background thread fetches from
+  NOAA SWPC public JSON API:
+    • https://services.swpc.noaa.gov/json/wwv.json (solar flux, sunspots, A/K)
+    • https://services.swpc.noaa.gov/json/goes/primary/xrays-6-hour.json (X-ray)
+    • https://services.swpc.noaa.gov/json/planetary_k_index_1m.json (K-index backup)
+  Refreshes every 30 min. Caches result, exposes get_current(). Uses urllib
+  (stdlib, no extra dep). User-Agent set per NOAA request. is_storm = K>=5,
+  is_quiet = K<=2.
+- Created magic_sdr/band_conditions.py — estimate_band_conditions() takes
+  SolarConditions + time of day and returns 10 BandCondition objects
+  (160m/80m/60m/40m/30m/20m/17m/15m/12m/10m). Each has rating (1-5 stars),
+  label (Excellent/Good/Fair/Poor/Closed), and a note explaining the rating.
+  Heuristics: day vs night, K-index penalty, X-ray penalty (M/X flares cause
+  D-layer absorption), SFI bonus (high solar flux = better F-layer). Test
+  verified storm conditions give lower ratings than quiet conditions.
+- Created magic_sdr/rds.py — RDSDecoder best-effort. Detects 19 kHz stereo
+  pilot via FFT (works with stock Gqrx audio output at 48 kHz). Full RDS
+  demodulation (PS/PTY/PI/RT) would require MPX audio output (not available
+  from stock Gqrx WFM demodulator — 57 kHz RDS subcarrier is above the 24
+  kHz Nyquist of 48 kHz audio). Also includes HD_RADIO_INFO_TEXT —
+  informational panel explaining HD Radio is proprietary and not decoded.
+- Updated magic_sdr/band_presets.py — added AM_BROADCAST band (540-1700 kHz)
+  with 9 Baltimore AM presets (WCAO 600, WFED 630, WYRE 810, WAMD 970,
+  WOLB 980, WBAL 1090, WJZ 1300, WAMD 1590, WTTZ 1670). Added 15 Baltimore
+  FM presets to FM_BROADCAST (WYPR 88.1, WEAA 88.9, WBJC 89.3, WTMD 89.7,
+  WETA 90.1, WERQ 92.3, WPOC 93.1, WWIN 95.5, WIYY 97.9, WHFS 99.1,
+  WLIF 101.9, WQSR 102.7, WSMJ 104.3, WWMX 106.5, WRBS 107.3). Adjusted
+  SHORTWAVE band to start at 1.7 MHz to avoid overlap with AM broadcast.
+  Total default bookmarks went from 88 to 112.
+- Updated magic_sdr/main_window.py — wired everything together:
+  • Top bar: ClockWidget
+  • Left column: FrequencyDial + TuningKnob side-by-side, SMeterWidget next
+    to signal bar, HiFi Equalizer group box with 10 vertical sliders + per-
+    band gain labels + Enabled checkbox + Flat reset button
+  • New "Conditions" tab: solar summary + 8 detailed solar fields
+    (SFI/SSN/A/K/X-ray/X-ray flux/updated/message) + 10-band HF conditions
+    with star ratings and colored labels, refresh button, last-updated status
+  • New "Signal Info" tab: RDS panel (pilot detection + PS/PTY/PI/RT
+    placeholders that explain MPX audio requirement) + HD Radio info text
+  • Wired EQ into audio chunk handler: applies before playback + recording
+  • Wired RDS decoder into audio chunk handler
+  • _on_signal_level also drives SMeterWidget
+  • _tune_to resets RDS decoder (different station = different RDS)
+  • Conditions timer (3 sec) refreshes solar + band conditions + RDS panels
+  • SolarFetcher starts at app launch (independent of Gqrx connection)
+  • closeEvent stops SolarFetcher + ClockWidget timers
+- Updated requirements.txt — added scipy>=1.10 (needed for EQ biquad filters)
+- Created scripts/test_new_features.py — 13 tests, all pass:
+  1. ClockWidget works
+  2. TuningKnob step cycling works (7 steps, full cycle returns to start)
+  3. SMeterWidget dBFS-to-angle mapping (S1=-90°, S9=0°, S9+40=+90°)
+  4. Equalizer works (flat = no-op, +10dB = +10.0dB boost verified)
+  5. EQ gain clamped to ±20 dB
+  6. SolarFetcher offline state is graceful
+  7. SolarConditions.summary() formats correctly
+  8. 10 HF bands estimated, storm < quiet conditions
+  9. RDS decoder handles low sample rate (no false pilot detection)
+  10. RDS decoder detects 19 kHz pilot (+217 dB above noise floor)
+  11. RDS decoder doesn't false-trigger on silence
+  12. Baltimore presets present (15 FM + 9 AM)
+  13. Full MainWindow integration with all 13 new attributes
+
+Bug found and fixed during testing:
+- scipy.signal.lfilter_zi returns the steady-state response to a STEP input
+  (constant 1.0). For zero-centered audio, this is the WRONG initial state —
+  it creates a transient that decays over ~100 ms. Fixed by initializing the
+  filter state to zeros instead. Verified +10 dB boost now reads correctly.
+
+Tests:
+- All 8 existing functional tests pass (regression check).
+- All 8 gqrx_config tests pass.
+- All scanner health tests pass (12 stations found in mock band).
+- All 13 new feature tests pass.
+
+Stage Summary:
+- All 8 requested features implemented and tested:
+  1. ✓ UTC + Local time (top bar, updates every second)
+  2. ✓ Solar conditions (NOAA SWPC API, 30-min refresh, 8 fields)
+  3. ✓ Band conditions (10 HF bands, star ratings, colored labels)
+  4. ✓ HD Radio + RDS (RDS pilot detection works; full RDS + HD Radio
+       decoding require MPX audio or proprietary codec — documented in UI)
+  5. ✓ Main tuning knob (drag/wheel/right-click, 7 step sizes)
+  6. ✓ Analog S-meter (needle gauge, S1-S9+40, smooth animation)
+  7. ✓ HiFi EQ (10-band, ±20 dB, RBJ biquad, processes audio + recordings)
+  8. ✓ Baltimore presets (15 FM + 9 AM, total bookmarks 88→112)
+- Total new code: 6 new modules (~1100 lines), main_window.py grew by ~400
+  lines for UI integration.
+- All tests pass (8 functional + 8 gqrx_config + scanner health + 13 new
+  features = 30+ tests).

@@ -46,6 +46,14 @@ from .ai_tagger import AITagger
 from .web_server import WebServer
 from .band_presets import BANDS, BANDS_BY_NAME, band_for_frequency, lookup_known, guess_modulation
 from .config import Config
+# New feature modules
+from .clock import ClockWidget
+from .tuning_knob import TuningKnob
+from .s_meter import SMeterWidget
+from .equalizer import Equalizer, EQ_BANDS_HZ
+from .solar import SolarFetcher, SolarConditions
+from .band_conditions import estimate_band_conditions, rating_to_stars, band_color
+from .rds import RDSDecoder, RDSInfo, HD_RADIO_INFO_TEXT
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +141,18 @@ class MainWindow(QMainWindow):
         self.ai_tagger.enabled = config.ai_tagging_enabled
         self.scanner.ai_tagger = self.ai_tagger if self.ai_tagger.enabled else None
 
+        # ---- New feature components ----
+        # 10-band HiFi EQ (processes audio before playback)
+        self.equalizer = Equalizer(
+            sample_rate=config.audio_sample_rate,
+            channels=config.audio_channels,
+        )
+        # RDS decoder (best-effort — only detects stereo pilot with stock Gqrx)
+        self.rds_decoder = RDSDecoder(sample_rate=config.audio_sample_rate)
+        # Solar conditions fetcher (background thread, hits NOAA SWPC API)
+        self.solar_fetcher = SolarFetcher()
+        # (Started after first successful Gqrx connect — see _on_gqrx_connected)
+
         # Web server (starts after the rest is wired)
         self.web_server: Optional[WebServer] = None
 
@@ -157,6 +177,17 @@ class MainWindow(QMainWindow):
         self.diag_timer.timeout.connect(self._update_diagnostic_banner)
         # Don't start until connected; see _on_gqrx_connected / _on_gqrx_disconnected.
 
+        # Conditions + RDS update timer — refreshes the Conditions tab (solar
+        # data, band conditions) and the Signal Info tab (RDS pilot detection)
+        # every 3 seconds. Solar data is cached by the SolarFetcher thread;
+        # this timer just refreshes the UI from the cache.
+        self.conditions_timer = QTimer(self)
+        self.conditions_timer.setInterval(3000)
+        self.conditions_timer.timeout.connect(self._update_conditions)
+        self.conditions_timer.timeout.connect(self._update_rds_panel)
+        # Start immediately (solar data is independent of Gqrx connection)
+        self.conditions_timer.start()
+
         # Apply initial state
         self._apply_config()
 
@@ -165,6 +196,16 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+
+        # ---- Top bar: UTC + Local clock ----
+        # Always visible at the top of the window, updated every second.
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.addStretch(1)
+        self.clock = ClockWidget()
+        top_bar.addWidget(self.clock)
+        top_bar.addStretch(1)
+        root.addLayout(top_bar)
 
         # ---- Diagnostic banner (top of window) ----
         # Shows a prominent red/amber message when Gqrx is connected but its
@@ -186,10 +227,17 @@ class MainWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
 
-        # Frequency dial
+        # Frequency dial + tuning knob side by side
+        freq_row = QHBoxLayout()
         self.dial = FrequencyDial()
         self.dial.tune_requested.connect(self._tune_to)
-        left_layout.addWidget(self.dial)
+        freq_row.addWidget(self.dial, stretch=1)
+        # Main tuning knob — drag up/down or use wheel to tune
+        self.tuning_knob = TuningKnob()
+        self.tuning_knob.tune_step.connect(self._on_knob_step)
+        self.tuning_knob.step_changed.connect(self._on_knob_step_changed)
+        freq_row.addWidget(self.tuning_knob)
+        left_layout.addLayout(freq_row)
 
         # Modulation + gain + squelch
         ctrl_box = QGroupBox("Receiver")
@@ -229,12 +277,18 @@ class MainWindow(QMainWindow):
         vol_row.addWidget(self.mute_btn)
         ctrl_layout.addRow("Volume:", vol_row)
 
-        # Signal level bar (using a QProgressBar as a meter)
+        # Signal level bar (using a QProgressBar as a meter) + analog S-meter
+        sig_row = QHBoxLayout()
         self.signal_bar = QProgressBar()
         self.signal_bar.setRange(-100, 0)
         self.signal_bar.setFormat("%v dB")
         self.signal_bar.setValue(-100)
-        ctrl_layout.addRow("Signal:", self.signal_bar)
+        self.signal_bar.setFixedWidth(120)
+        sig_row.addWidget(self.signal_bar)
+        # Analog S-meter (needle-style gauge)
+        self.s_meter = SMeterWidget()
+        sig_row.addWidget(self.s_meter, stretch=1)
+        ctrl_layout.addRow("Signal:", sig_row)
 
         left_layout.addWidget(ctrl_box)
 
@@ -278,6 +332,54 @@ class MainWindow(QMainWindow):
         self.web_url = QLabel(f"http://0.0.0.0:{self.config.web_port}")
         web_layout.addWidget(self.web_url)
         left_layout.addWidget(web_box)
+
+        # HiFi EQ — 10-band graphic equalizer
+        eq_box = QGroupBox("HiFi Equalizer (10-band)")
+        eq_outer = QVBoxLayout(eq_box)
+        # EQ enable checkbox + reset button
+        eq_top_row = QHBoxLayout()
+        self.eq_enabled_chk = QCheckBox("Enabled")
+        self.eq_enabled_chk.setChecked(True)
+        self.eq_enabled_chk.toggled.connect(self._on_eq_enabled_toggled)
+        eq_top_row.addWidget(self.eq_enabled_chk)
+        eq_top_row.addStretch(1)
+        eq_reset_btn = QPushButton("Flat")
+        eq_reset_btn.clicked.connect(self._on_eq_reset)
+        eq_top_row.addWidget(eq_reset_btn)
+        eq_outer.addLayout(eq_top_row)
+        # EQ sliders — 10 vertical sliders, one per band
+        eq_sliders_row = QHBoxLayout()
+        eq_sliders_row.setSpacing(4)
+        self.eq_sliders: list[QSlider] = []
+        for i, freq in enumerate(EQ_BANDS_HZ):
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            sld = QSlider(Qt.Vertical)
+            sld.setRange(-20, 20)
+            sld.setValue(0)
+            sld.setTickPosition(QSlider.TicksBothSides)
+            sld.setTickInterval(5)
+            sld.valueChanged.connect(lambda v, idx=i: self._on_eq_slider_changed(idx, v))
+            self.eq_sliders.append(sld)
+            col.addWidget(sld, stretch=1)
+            # Frequency label
+            if freq >= 1000:
+                freq_str = f"{freq // 1000}k"
+            else:
+                freq_str = str(freq)
+            lbl = QLabel(freq_str)
+            lbl.setStyleSheet("color: #888; font-size: 9px;")
+            lbl.setAlignment(Qt.AlignCenter)
+            col.addWidget(lbl)
+            # Gain label (updates live)
+            gain_lbl = QLabel("+0")
+            gain_lbl.setStyleSheet("color: #5cd9ff; font-size: 9px; font-family: monospace;")
+            gain_lbl.setAlignment(Qt.AlignCenter)
+            gain_lbl.setObjectName(f"eq_gain_lbl_{i}")
+            col.addWidget(gain_lbl)
+            eq_sliders_row.addLayout(col)
+        eq_outer.addLayout(eq_sliders_row)
+        left_layout.addWidget(eq_box)
 
         left_layout.addStretch(1)
         splitter.addWidget(left)
@@ -372,6 +474,122 @@ class MainWindow(QMainWindow):
         self.rec_list = QListWidget()
         rec_layout.addWidget(self.rec_list, stretch=1)
         self.tabs.addTab(rec_widget, "Recordings")
+
+        # Conditions tab — solar flux, K-index, band-by-band propagation
+        cond_widget = QWidget()
+        cond_layout = QVBoxLayout(cond_widget)
+        # Solar summary at top
+        solar_box = QGroupBox("Solar Conditions (NOAA SWPC)")
+        solar_outer = QVBoxLayout(solar_box)
+        self.solar_summary_label = QLabel("Loading…")
+        self.solar_summary_label.setStyleSheet(
+            "font-family: monospace; font-size: 13px; color: #5cd9ff; padding: 8px;"
+        )
+        self.solar_summary_label.setWordWrap(True)
+        solar_outer.addWidget(self.solar_summary_label)
+        # Detailed solar fields in a grid
+        solar_grid = QGridLayout()
+        solar_grid.setSpacing(6)
+        self.solar_detail_labels: dict[str, QLabel] = {}
+        for i, field in enumerate([
+            ("sfi", "Solar Flux (F10.7):"),
+            ("ssn", "Sunspot Number:"),
+            ("aindex", "Planetary A-index:"),
+            ("kindex", "Planetary K-index:"),
+            ("xray", "X-ray Class:"),
+            ("xray_flux", "X-ray Flux:"),
+            ("updated", "Last Updated:"),
+            ("message", "NOAA Message:"),
+        ]):
+            key, lbl_text = field
+            lbl_l = QLabel(lbl_text)
+            lbl_l.setStyleSheet("color: #888;")
+            solar_grid.addWidget(lbl_l, i, 0)
+            val_lbl = QLabel("—")
+            val_lbl.setStyleSheet("color: #fff; font-family: monospace;")
+            val_lbl.setWordWrap(True)
+            solar_grid.addWidget(val_lbl, i, 1)
+            self.solar_detail_labels[key] = val_lbl
+        solar_outer.addLayout(solar_grid)
+        # Refresh button for solar data
+        solar_refresh_row = QHBoxLayout()
+        solar_refresh_btn = QPushButton("⟳ Refresh Now")
+        solar_refresh_btn.clicked.connect(lambda: self.solar_fetcher.force_refresh())
+        solar_refresh_row.addWidget(solar_refresh_btn)
+        solar_refresh_row.addStretch(1)
+        self.solar_status_lbl = QLabel("")
+        self.solar_status_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        solar_refresh_row.addWidget(self.solar_status_lbl)
+        solar_outer.addLayout(solar_refresh_row)
+        cond_layout.addWidget(solar_box)
+
+        # Band conditions table
+        band_box = QGroupBox("HF Band Conditions (estimated from solar + time)")
+        band_outer = QVBoxLayout(band_box)
+        self.band_conditions_label = QLabel("Loading…")
+        self.band_conditions_label.setStyleSheet(
+            "font-family: monospace; font-size: 12px; padding: 8px;"
+        )
+        self.band_conditions_label.setWordWrap(True)
+        band_outer.addWidget(self.band_conditions_label)
+        cond_layout.addWidget(band_box)
+        cond_layout.addStretch(1)
+        self.tabs.addTab(cond_widget, "Conditions")
+
+        # Signal Info tab — RDS + HD Radio
+        sig_widget = QWidget()
+        sig_layout = QVBoxLayout(sig_widget)
+        # RDS panel
+        rds_box = QGroupBox("RDS (FM Radio Data System)")
+        rds_outer = QVBoxLayout(rds_box)
+        rds_intro = QLabel(
+            "RDS carries station name (PS), program type (PTY), and radio text (RT) "
+            "on a 57 kHz subcarrier. The 19 kHz stereo pilot is detected from the "
+            "audio; full RDS decoding requires MPX audio output (not available from "
+            "stock Gqrx WFM demodulator)."
+        )
+        rds_intro.setWordWrap(True)
+        rds_intro.setStyleSheet("color: #888; font-size: 10px;")
+        rds_outer.addWidget(rds_intro)
+        rds_grid = QGridLayout()
+        rds_grid.setSpacing(6)
+        for i, (key, lbl_text) in enumerate([
+            ("pilot", "Stereo Pilot:"),
+            ("pilot_str", "Pilot Strength:"),
+            ("ps", "Station Name (PS):"),
+            ("pty", "Program Type (PTY):"),
+            ("pi", "Program ID (PI):"),
+            ("rt", "Radio Text (RT):"),
+        ]):
+            lbl = QLabel(lbl_text)
+            lbl.setStyleSheet("color: #888;")
+            rds_grid.addWidget(lbl, i, 0)
+            val = QLabel("—")
+            val.setStyleSheet("color: #5cd9ff; font-family: monospace;")
+            val.setWordWrap(True)
+            rds_grid.addWidget(val, i, 1)
+        self.rds_labels = {
+            "pilot": rds_grid.itemAtPosition(0, 1).widget(),
+            "pilot_str": rds_grid.itemAtPosition(1, 1).widget(),
+            "ps": rds_grid.itemAtPosition(2, 1).widget(),
+            "pty": rds_grid.itemAtPosition(3, 1).widget(),
+            "pi": rds_grid.itemAtPosition(4, 1).widget(),
+            "rt": rds_grid.itemAtPosition(5, 1).widget(),
+        }
+        rds_outer.addLayout(rds_grid)
+        sig_layout.addWidget(rds_box)
+
+        # HD Radio info panel
+        hd_box = QGroupBox("HD Radio")
+        hd_outer = QVBoxLayout(hd_box)
+        hd_text = QLabel(HD_RADIO_INFO_TEXT)
+        hd_text.setWordWrap(True)
+        hd_text.setStyleSheet("color: #ccc; font-size: 11px;")
+        hd_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        hd_outer.addWidget(hd_text)
+        sig_layout.addWidget(hd_box)
+        sig_layout.addStretch(1)
+        self.tabs.addTab(sig_widget, "Signal Info")
 
         # Settings tab
         set_widget = QWidget()
@@ -522,6 +740,10 @@ class MainWindow(QMainWindow):
         # Auto-start web server if enabled
         if self.config.remote_access_enabled:
             QTimer.singleShot(500, lambda: self.web_btn.click())
+        # Start solar fetcher (independent of Gqrx — runs from app launch)
+        self.solar_fetcher.start()
+        # Trigger initial conditions panel update
+        QTimer.singleShot(100, self._update_conditions)
 
     # ----------------------------- handlers -----------------------------
     def _on_connect_clicked(self) -> None:
@@ -835,22 +1057,158 @@ class MainWindow(QMainWindow):
 
     def _on_signal_level(self, lvl: float) -> None:
         self.signal_bar.setValue(int(lvl))
+        # Drive the analog S-meter too
+        self.s_meter.set_level(lvl)
         # Also feed the recording manager
         if self.recordings.is_recording:
             # will be picked up on next audio chunk
             pass
 
     def _on_audio_chunk(self, chunk: np.ndarray, sample_rate: int, channels: int) -> None:
+        # Apply EQ (no-op if disabled or flat — preserves CPU)
+        processed = self.equalizer.process(chunk, sample_rate=sample_rate)
         # Playback
-        self.audio_player.push(chunk)
-        # Recording
+        self.audio_player.push(processed)
+        # Recording (uses processed audio so the EQ affects recordings too)
         if self.recordings.is_recording:
             lvl = self.gqrx.get_signal_level() or -120.0
-            self.recordings.write_chunk(chunk, sample_rate, channels, signal_level_db=lvl)
+            self.recordings.write_chunk(processed, sample_rate, channels, signal_level_db=lvl)
         # Audio-FFT spectrum fallback — only feed if no UDP spectrum is arriving
         # (avoid wasting CPU computing FFTs when we have real RF spectrum data)
         if not self.spectrum_receiver.is_streaming(max_age_s=1.0):
-            self.audio_spectrum.process_audio(chunk, sample_rate, channels)
+            self.audio_spectrum.process_audio(processed, sample_rate, channels)
+        # RDS decoder — best-effort, only fires when tuned to an FM band
+        # (the decoder itself checks for 19 kHz pilot feasibility based on
+        # sample rate)
+        try:
+            self.rds_decoder.process_audio(processed, sample_rate)
+        except Exception as e:
+            log.debug("RDS decoder error: %s", e)
+
+    # ----------------------------- tuning knob -----------------------------
+    def _on_knob_step(self, step_hz: int) -> None:
+        """Called when the tuning knob is dragged/wheeled by one step."""
+        if not self.gqrx.is_connected():
+            return
+        new_freq = self.config.last_frequency_hz + step_hz
+        # Clamp to a reasonable range (100 kHz to 2 GHz)
+        new_freq = max(100_000, min(2_000_000_000, new_freq))
+        self._tune_to(new_freq)
+
+    def _on_knob_step_changed(self, step_hz: int) -> None:
+        """Called when the user right-clicks the knob to cycle step size."""
+        if step_hz >= 1_000_000:
+            txt = f"Tuning step: {step_hz // 1_000_000} MHz"
+        elif step_hz >= 1_000:
+            txt = f"Tuning step: {step_hz // 1_000} kHz"
+        else:
+            txt = f"Tuning step: {step_hz} Hz"
+        self.status.showMessage(txt, 2000)
+
+    # ----------------------------- EQ handlers -----------------------------
+    def _on_eq_slider_changed(self, band_idx: int, value: int) -> None:
+        """Called when an EQ slider is moved."""
+        self.equalizer.set_band_gain(band_idx, float(value))
+        # Update the per-band gain label
+        lbl = self.findChild(QLabel, f"eq_gain_lbl_{band_idx}")
+        if lbl:
+            sign = "+" if value >= 0 else ""
+            lbl.setText(f"{sign}{value}")
+        # Update the slider's tooltip
+        if 0 <= band_idx < len(self.eq_sliders):
+            freq = EQ_BANDS_HZ[band_idx]
+            self.eq_sliders[band_idx].setToolTip(
+                f"{freq} Hz: {value:+d} dB"
+            )
+
+    def _on_eq_enabled_toggled(self, enabled: bool) -> None:
+        self.equalizer.set_enabled(enabled)
+
+    def _on_eq_reset(self) -> None:
+        """Reset all EQ bands to 0 dB."""
+        for sld in self.eq_sliders:
+            sld.setValue(0)
+        self.equalizer.reset()
+
+    # ----------------------------- conditions / RDS update -----------------------------
+    def _update_conditions(self) -> None:
+        """Periodic refresh of solar + band conditions panels."""
+        cond = self.solar_fetcher.get_current()
+        if cond is None:
+            self.solar_summary_label.setText("No data yet (waiting for NOAA SWPC fetch)…")
+            self.solar_status_lbl.setText(self.solar_fetcher.last_error or "Fetching…")
+        else:
+            self.solar_summary_label.setText(cond.summary())
+            self.solar_detail_labels["sfi"].setText(
+                f"{cond.solar_flux:.0f} sfu" if cond.solar_flux is not None else "—"
+            )
+            self.solar_detail_labels["ssn"].setText(
+                str(cond.sunspot_number) if cond.sunspot_number is not None else "—"
+            )
+            self.solar_detail_labels["aindex"].setText(
+                f"{cond.a_index:.0f}" if cond.a_index is not None else "—"
+            )
+            self.solar_detail_labels["kindex"].setText(
+                f"{cond.k_index}  ({'storm' if cond.is_storm else 'quiet' if cond.is_quiet else 'active'})"
+                if cond.k_index is not None else "—"
+            )
+            self.solar_detail_labels["xray"].setText(
+                cond.xray_class or "—"
+            )
+            self.solar_detail_labels["xray_flux"].setText(
+                f"{cond.xray_flux:.2e} W/m²" if cond.xray_flux is not None else "—"
+            )
+            from datetime import datetime
+            self.solar_detail_labels["updated"].setText(
+                datetime.fromtimestamp(cond.timestamp).strftime("%Y-%m-%d %H:%M UTC")
+            )
+            self.solar_detail_labels["message"].setText(cond.message or "—")
+            # Status
+            age_s = time.time() - self.solar_fetcher.last_fetch_time
+            if self.solar_fetcher.last_error:
+                self.solar_status_lbl.setText(
+                    f"Last error: {self.solar_fetcher.last_error} (last OK {age_s:.0f}s ago)"
+                )
+            else:
+                self.solar_status_lbl.setText(f"Last updated {age_s:.0f}s ago")
+
+            # Update band conditions
+            bands = estimate_band_conditions(cond)
+            lines = []
+            for bc in bands:
+                stars = rating_to_stars(bc.rating)
+                color = band_color(bc.rating)
+                line = (
+                    f"<span style='color:{color};'>{stars}</span> "
+                    f"<b>{bc.band}</b> ({bc.freq_mhz:.1f} MHz) — "
+                    f"<span style='color:{color};'>{bc.label}</span> — "
+                    f"<span style='color:#888;'>{bc.note}</span>"
+                )
+                lines.append(line)
+            self.band_conditions_label.setText("<br>".join(lines))
+
+    def _update_rds_panel(self) -> None:
+        """Periodic refresh of the RDS info panel."""
+        info = self.rds_decoder.info
+        if info.stereo_pilot_detected:
+            self.rds_labels["pilot"].setText("✓ Detected (stereo broadcast)")
+            self.rds_labels["pilot"].setStyleSheet("color: #3aaa55; font-family: monospace;")
+        else:
+            self.rds_labels["pilot"].setText("✗ Not detected")
+            self.rds_labels["pilot"].setStyleSheet("color: #888; font-family: monospace;")
+        if info.pilot_strength_db is not None:
+            self.rds_labels["pilot_str"].setText(f"{info.pilot_strength_db:+.1f} dB above noise")
+        else:
+            self.rds_labels["pilot_str"].setText("—")
+        # PS, PTY, PI, RT — would come from full RDS decoding, which needs MPX audio
+        self.rds_labels["ps"].setText(info.ps or "— (requires MPX audio)")
+        self.rds_labels["pty"].setText(
+            info.pty_label or "— (requires MPX audio)"
+        )
+        self.rds_labels["pi"].setText(
+            f"0x{info.pi:04X}" if info.pi is not None else "— (requires MPX audio)"
+        )
+        self.rds_labels["rt"].setText(info.rt or "— (requires MPX audio)")
 
     def _tune_to(self, freq_hz: int) -> None:
         if not self.gqrx.is_connected():
@@ -861,6 +1219,8 @@ class MainWindow(QMainWindow):
         if self.mod_combo.currentText() != mod:
             self.gqrx.set_modulation(mod)
         self.gqrx.set_frequency(freq_hz)
+        # Reset RDS decoder on tune (different station → different RDS data)
+        self.rds_decoder.reset()
 
     def _on_modulation_changed(self, mod: str) -> None:
         if self.gqrx.is_connected():
@@ -1259,6 +1619,14 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.gqrx.disconnect()
+        except Exception:
+            pass
+        try:
+            self.solar_fetcher.stop()
+        except Exception:
+            pass
+        try:
+            self.clock.stop()
         except Exception:
             pass
         super().closeEvent(event)

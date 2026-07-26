@@ -32,6 +32,7 @@ class Band(NamedTuple):
 
 # ----------------------------- FM Broadcast -----------------------------
 # 88–108 MHz, WFM stereo. Step 200 kHz (US/EU channel spacing).
+# Includes Baltimore, MD area presets.
 FM_BROADCAST = Band(
     name="FM Broadcast",
     start_mhz=88.0,
@@ -39,7 +40,49 @@ FM_BROADCAST = Band(
     modulation="WFM_ST",
     step_khz=200.0,
     description="FM broadcast radio (88–108 MHz). Stereo WFM with 75 µs de-emphasis.",
-    known={},  # Stations are local; user adds via bookmarks.
+    known={
+        # ---- Baltimore, MD area FM stations ----
+        88_100_000: "WYPR 88.1 — Baltimore NPR News/Talk",
+        88_900_000: "WEAA 88.9 — Morgan State Jazz",
+        89_300_000: "WBJC 89.3 — Classical",
+        89_700_000: "WTMD 89.7 — Towson Univ. Alt/Indie",
+        90_100_000: "WETA 90.1 — DC NPR Classical (audible in Balt.)",
+        92_300_000: "WERQ 92.3 — Urban/Hip-Hop '92Q'",
+        93_100_000: "WPOC 93.1 — Country '93.1 WPOC'",
+        95_500_000: "WWIN 95.5 — Urban AC 'Magic 95.5'",
+        97_900_000: "WIYY 97.9 — Rock '98 Rock'",
+        99_100_000: "WHFS 99.1 — Alt Rock '99.1 HFS'",
+        101_900_000: "WLIF 101.9 — Adult Contemp 'Today's 101.9'",
+        102_700_000: "WQSR 102.7 — Classic Hits '102.7 Jack FM'",
+        104_300_000: "WSMJ 104.3 — Smooth Jazz",
+        106_500_000: "WWMX 106.5 — Adult Top 40 'Mix 106.5'",
+        107_300_000: "WRBS 107.3 — Religious '95.1 Shine FM relay'",
+    },
+)
+
+
+# ----------------------------- AM Broadcast -----------------------------
+# 540–1700 kHz, AM. Step 10 kHz (US channel spacing).
+# Includes Baltimore, MD area presets.
+AM_BROADCAST = Band(
+    name="AM Broadcast",
+    start_mhz=0.540,
+    end_mhz=1.700,
+    modulation="AM",
+    step_khz=10.0,
+    description="AM broadcast radio (540–1700 kHz). Requires RTL-SDR V3 direct sampling (Q-branch).",
+    known={
+        # ---- Baltimore, MD area AM stations ----
+        600_000: "WCAO 600 — Gospel 'Heaven 600'",
+        630_000: "WFED 630 — Federal News Network",
+        810_000: "WYRE 810 — Annapolis Adult Standards",
+        970_000: "WAMD 970 — Aberdeen MD",
+        980_000: "WOLB 980 — Talk",
+        1090_000: "WBAL 1090 — News/Talk 'WBAL NewsRadio' (50kW clear-channel)",
+        1300_000: "WJZ 1300 — Sports Talk",
+        1590_000: "WAMD 1590 — Religious",
+        1670_000: "WTTZ 1670 — Religious (Lutherville MD)",
+    },
 )
 
 
@@ -163,15 +206,16 @@ MARINE_VHF = Band(
 
 
 # ----------------------------- Shortwave (HF, RTL-SDR V3 direct sampling) -----------------------------
-# 0–30 MHz, requires RTL-SDR V3 Q-branch direct sampling mode (no upconverter).
+# 1.7–30 MHz, requires RTL-SDR V3 Q-branch direct sampling mode (no upconverter).
 # Gqrx supports this via Device Settings → Direct sampling → Q-branch.
+# (AM broadcast 540-1700 kHz is a separate band — see AM_BROADCAST above.)
 SHORTWAVE = Band(
     name="Shortwave (HF)",
-    start_mhz=0.5,
+    start_mhz=1.7,
     end_mhz=30.0,
     modulation="AM",
     step_khz=10.0,
-    description="HF shortwave (0.5–30 MHz). Requires RTL-SDR V3 direct sampling (Q-branch). International broadcasters, ham, utility, CB.",
+    description="HF shortwave (1.7–30 MHz). Requires RTL-SDR V3 direct sampling (Q-branch). International broadcasters, ham, utility, CB.",
     known={
         # HF amateur bands
         1_800_000: "160m Ham (1.8–2.0 MHz)",
@@ -209,6 +253,7 @@ SHORTWAVE = Band(
 
 BANDS: List[Band] = [
     FM_BROADCAST,
+    AM_BROADCAST,
     AIRBAND,
     NOAA_WEATHER,
     HAM_2M,
