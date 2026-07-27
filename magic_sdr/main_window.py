@@ -1254,6 +1254,32 @@ class MainWindow(QMainWindow):
             # Start audio + spectrum receivers
             self.audio_receiver.start()
             self.spectrum_receiver.start()
+            # Start the LOCAL audio playback — this is what actually produces
+            # sound from the Magic SDR Player. The audio pipeline is:
+            #   Gqrx → UDP → AudioReceiver → EQ → limiter → AudioPlayer → speaker
+            # If AudioPlayer fails to start, the user will hear nothing
+            # (or whatever Gqrx itself plays). Tell them clearly.
+            if not self.audio_player.start():
+                QMessageBox.warning(
+                    self, "Audio output unavailable",
+                    "Magic SDR could not open the local audio output device.\n\n"
+                    "You will still see the visualizer, but you will NOT hear\n"
+                    "audio from Magic SDR's EQ/limiter pipeline.\n\n"
+                    "Make sure 'sounddevice' is installed (pip install sounddevice)\n"
+                    "and that no other app has exclusive access to your speakers."
+                )
+            else:
+                # Mute Gqrx's own audio output (AF gain = 0) so the user
+                # ONLY hears the EQ'd audio from Magic SDR. Otherwise both
+                # Gqrx and Magic SDR would play simultaneously, doubling
+                # the audio and making the EQ sound like it has no effect
+                # (because the bypassed Gqrx audio dominates).
+                self.gqrx.set_audio_gain(0)
+                self.status.showMessage(
+                    "Audio pipeline active. Gqrx's own audio muted — "
+                    "you now hear ONLY Magic SDR's EQ'd audio.",
+                    10000,
+                )
             # Restore state
             self.gqrx.set_frequency(self.config.last_frequency_hz)
             self.gqrx.set_modulation(self.config.last_modulation)
@@ -2489,6 +2515,14 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.spectrum_receiver.stop()
+        except Exception:
+            pass
+        try:
+            # Restore Gqrx's audio gain to a reasonable level (was muted
+            # so Magic SDR could be the sole audio source). 200 is a
+            # moderate listening level on the 0..1000 Gqrx scale.
+            if self.gqrx.is_connected():
+                self.gqrx.set_audio_gain(200)
         except Exception:
             pass
         try:

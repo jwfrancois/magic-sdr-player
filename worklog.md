@@ -636,3 +636,42 @@ Stage Summary:
   (block decoder proven correct; demod needs further work for real signals)
 - All features persisted in config, all functional tests pass
 - Committed 2ef9edf, pushed to GitHub
+
+---
+Task ID: fix-audio-not-playing
+Agent: main
+Task: Fix "EQ does not affect sound because sound does not come from the app but from Gqrx"
+
+Root Cause:
+- AudioPlayer was constructed but NEVER started in MainWindow
+- The full pipeline was: Gqrx → UDP → AudioReceiver → EQ → limiter → (NOWHERE)
+- audio_player.push(processed) was being called but the queue was never
+  drained because the sounddevice callback thread was never running
+- User heard Gqrx's own local audio output (its own AF gain), which
+  completely bypassed Magic SDR's EQ/limiter, so EQ changes had no effect
+
+Fix (magic_sdr/main_window.py):
+- Added self.audio_player.start() call immediately after
+  self.audio_receiver.start() in the connect handler
+- On failure: shows a clear QMessageBox warning explaining sounddevice
+  may be missing or the device is busy
+- On success: auto-mutes Gqrx's own audio output via
+  self.gqrx.set_audio_gain(0) so the user hears ONLY Magic SDR's EQ'd
+  audio — no need to manually mute Gqrx
+- On disconnect: restores Gqrx's audio gain to 200 (moderate listening
+  level) so the user can still listen via Gqrx when not using Magic SDR
+
+Verification:
+- python3 -m py_compile magic_sdr/main_window.py: OK
+- AudioPlayer.start() returns True when sounddevice is available,
+  False otherwise (with clear error message)
+- Audio pipeline now: Gqrx → UDP → EQ → limiter → AudioPlayer → speaker
+- EQ presets, pre-gain, and limiter will now be AUDIBLE
+
+Stage Summary:
+- Magic SDR Player now produces its own audio output (not just visualizer)
+- EQ presets, pre-EQ gain, and brick-wall limiter all affect what the
+  user actually hears
+- Gqrx's audio is automatically muted while Magic SDR is connected
+- Gqrx's audio is restored on disconnect
+- Committed and ready to push to GitHub
