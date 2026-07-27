@@ -27,13 +27,13 @@ from typing import Optional
 
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, Q_ARG, pyqtSlot
-from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
+from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QKeySequence
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QTabWidget,
     QLabel, QPushButton, QComboBox, QSlider, QLineEdit, QSpinBox, QDoubleSpinBox,
     QListWidget, QListWidgetItem, QProgressBar, QStatusBar, QMessageBox,
     QGroupBox, QFormLayout, QCheckBox, QFileDialog, QSplitter, QFrame,
-    QApplication, QStyle
+    QApplication, QStyle, QAction, QShortcut
 )
 
 from .gqrx_client import GqrxClient, MODULATIONS
@@ -420,8 +420,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(web_box)
 
         # HiFi EQ — 10-band graphic equalizer + 16 named presets
-        eq_box = QGroupBox("HiFi Equalizer (10-band)")
-        eq_outer = QVBoxLayout(eq_box)
+        self.eq_box = QGroupBox("HiFi Equalizer (10-band)")
+        eq_outer = QVBoxLayout(self.eq_box)
         # EQ enable checkbox + preset dropdown + reset button
         eq_top_row = QHBoxLayout()
         self.eq_enabled_chk = QCheckBox("Enabled")
@@ -437,9 +437,13 @@ class MainWindow(QMainWindow):
         eq_reset_btn.clicked.connect(self._on_eq_reset)
         eq_top_row.addWidget(eq_reset_btn)
         eq_outer.addLayout(eq_top_row)
-        # EQ sliders — 10 vertical sliders, one per band
-        eq_sliders_row = QHBoxLayout()
-        eq_sliders_row.setSpacing(4)
+        # EQ sliders — 10 vertical sliders, one per band.
+        # Wrapped in a container widget so compact mode can hide the whole
+        # slider bank in one setVisible() call (keeping the preset dropdown).
+        self.eq_sliders_container = QWidget()
+        self.eq_sliders_row = QHBoxLayout(self.eq_sliders_container)
+        self.eq_sliders_row.setContentsMargins(0, 0, 0, 0)
+        self.eq_sliders_row.setSpacing(4)
         self.eq_sliders: list[QSlider] = []
         for i, freq in enumerate(EQ_BANDS_HZ):
             col = QVBoxLayout()
@@ -467,9 +471,9 @@ class MainWindow(QMainWindow):
             gain_lbl.setAlignment(Qt.AlignCenter)
             gain_lbl.setObjectName(f"eq_gain_lbl_{i}")
             col.addWidget(gain_lbl)
-            eq_sliders_row.addLayout(col)
-        eq_outer.addLayout(eq_sliders_row)
-        left_layout.addWidget(eq_box)
+            self.eq_sliders_row.addLayout(col)
+        eq_outer.addWidget(self.eq_sliders_container)
+        left_layout.addWidget(self.eq_box)
 
         # Time-Travel audio buffer — rewind up to 30 seconds of live radio
         left_layout.addWidget(self.time_travel_widget)
@@ -498,6 +502,12 @@ class MainWindow(QMainWindow):
 
         # Audio Visualizer — multi-mode live visualization
         # (oscilloscope / spectrum bars / circular / liquid light)
+        # Wrapped in a single panel widget so compact mode can hide the whole
+        # block (label + mode combo + canvas) in one call.
+        self.viz_panel = QWidget()
+        viz_outer = QVBoxLayout(self.viz_panel)
+        viz_outer.setContentsMargins(0, 0, 0, 0)
+        viz_outer.setSpacing(2)
         viz_row = QHBoxLayout()
         viz_row.setContentsMargins(0, 0, 0, 0)
         viz_label = QLabel("◈ Visualizer")
@@ -512,14 +522,15 @@ class MainWindow(QMainWindow):
         )
         viz_row.addWidget(self.viz_mode_combo)
         viz_row.addStretch(1)
-        right_layout.addLayout(viz_row)
+        viz_outer.addLayout(viz_row)
         # The visualizer itself — compact height to keep waterfall dominant
-        viz_container = QWidget()
-        viz_container.setFixedHeight(120)
-        viz_container_l = QVBoxLayout(viz_container)
+        self.viz_container = QWidget()
+        self.viz_container.setFixedHeight(120)
+        viz_container_l = QVBoxLayout(self.viz_container)
         viz_container_l.setContentsMargins(0, 0, 0, 0)
         viz_container_l.addWidget(self.audio_visualizer)
-        right_layout.addWidget(viz_container)
+        viz_outer.addWidget(self.viz_container)
+        right_layout.addWidget(self.viz_panel)
 
         self.tabs = QTabWidget()
         right_layout.addWidget(self.tabs, stretch=1)
@@ -975,6 +986,44 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("Ready. Click 'Connect' to attach to Gqrx.")
 
+        # ---- Menu bar: View menu with Compact Mode toggle ----
+        view_menu = self.menuBar().addMenu("&View")
+        self.compact_action = QAction("&Compact Mode", self, checkable=True)
+        self.compact_action.setChecked(self.config.compact_mode)
+        self.compact_action.setShortcut(QKeySequence("Ctrl+M"))
+        self.compact_action.setStatusTip(
+            "Compact Mode — hide visualizer, time-travel, and EQ sliders; "
+            "shrink memory buttons. (Ctrl+M)"
+        )
+        self.compact_action.toggled.connect(self._on_compact_mode_toggled)
+        view_menu.addAction(self.compact_action)
+
+        view_menu.addSeparator()
+        # Quick toggles for individual panels (handy even outside compact mode)
+        self.toggle_viz_action = QAction("Show &Visualizer", self, checkable=True)
+        self.toggle_viz_action.setChecked(True)
+        self.toggle_viz_action.setStatusTip("Show or hide the audio visualizer panel.")
+        self.toggle_viz_action.toggled.connect(self._on_toggle_visualizer)
+        view_menu.addAction(self.toggle_viz_action)
+
+        self.toggle_eq_action = QAction("Show EQ &Sliders", self, checkable=True)
+        self.toggle_eq_action.setChecked(True)
+        self.toggle_eq_action.setStatusTip("Show or hide the 10-band EQ sliders (preset dropdown stays).")
+        self.toggle_eq_action.toggled.connect(self._on_toggle_eq_sliders)
+        view_menu.addAction(self.toggle_eq_action)
+
+        self.toggle_timetravel_action = QAction("Show &Time-Travel", self, checkable=True)
+        self.toggle_timetravel_action.setChecked(True)
+        self.toggle_timetravel_action.setStatusTip("Show or hide the Time-Travel rewind bar.")
+        self.toggle_timetravel_action.toggled.connect(self._on_toggle_time_travel)
+        view_menu.addAction(self.toggle_timetravel_action)
+
+        view_menu.addSeparator()
+        reset_layout_action = QAction("&Reset Window Layout", self)
+        reset_layout_action.setStatusTip("Restore all panels to their default visibility.")
+        reset_layout_action.triggered.connect(self._on_reset_layout)
+        view_menu.addAction(reset_layout_action)
+
     # ----------------------------- signal wiring -----------------------------
     def _wire_signals(self) -> None:
         # Gqrx signals
@@ -1088,6 +1137,14 @@ class MainWindow(QMainWindow):
         self.config.dx_cluster_enabled = self.set_dx_autostart.isChecked()
         self.config.cw_decoder_enabled = self.set_cw_enabled.isChecked()
         self.cw_decoder.enabled = self.config.cw_decoder_enabled
+
+        # ---- Apply compact mode on startup (if saved in config) ----
+        # Sync the menu checkbox without firing toggled signal (which would
+        # show a status message and re-save config unnecessarily at startup).
+        self.compact_action.blockSignals(True)
+        self.compact_action.setChecked(self.config.compact_mode)
+        self.compact_action.blockSignals(False)
+        self._apply_compact_visibility(self.config.compact_mode)
 
     def _save_magic_state(self) -> None:
         """Persist all the magic-feature state to config."""
@@ -1552,6 +1609,78 @@ class MainWindow(QMainWindow):
     def _on_viz_mode_changed(self, mode: str) -> None:
         self.status.showMessage(f"Visualizer: {mode} (right-click visualizer to cycle)", 2000)
         self._save_magic_state()
+
+    # ----------------------------- compact mode / view toggles -----------------------------
+    def _apply_compact_visibility(self, on: bool) -> None:
+        """Apply or release compact-mode panel visibility (no side effects)."""
+        if on:
+            self.viz_panel.setVisible(False)
+            self.toggle_viz_action.blockSignals(True)
+            self.toggle_viz_action.setChecked(False)
+            self.toggle_viz_action.blockSignals(False)
+            self.time_travel_widget.setVisible(False)
+            self.toggle_timetravel_action.blockSignals(True)
+            self.toggle_timetravel_action.setChecked(False)
+            self.toggle_timetravel_action.blockSignals(False)
+            self.eq_sliders_container.setVisible(False)
+            self.toggle_eq_action.blockSignals(True)
+            self.toggle_eq_action.setChecked(False)
+            self.toggle_eq_action.blockSignals(False)
+            for btn in self.memory_bar.buttons:
+                btn.setMinimumHeight(30)
+                btn.setMinimumWidth(60)
+        else:
+            self.viz_panel.setVisible(True)
+            self.toggle_viz_action.blockSignals(True)
+            self.toggle_viz_action.setChecked(True)
+            self.toggle_viz_action.blockSignals(False)
+            self.time_travel_widget.setVisible(True)
+            self.toggle_timetravel_action.blockSignals(True)
+            self.toggle_timetravel_action.setChecked(True)
+            self.toggle_timetravel_action.blockSignals(False)
+            self.eq_sliders_container.setVisible(True)
+            self.toggle_eq_action.blockSignals(True)
+            self.toggle_eq_action.setChecked(True)
+            self.toggle_eq_action.blockSignals(False)
+            for btn in self.memory_bar.buttons:
+                btn.setMinimumHeight(40)
+                btn.setMinimumWidth(72)
+
+    def _on_compact_mode_toggled(self, on: bool) -> None:
+        """Toggle Compact Mode (menu action handler).
+
+        Compact Mode hides the visualizer, Time-Travel bar, and EQ sliders,
+        and shrinks the memory preset buttons — giving maximum space to the
+        waterfall and the receiver controls.
+        """
+        self.config.compact_mode = on
+        self._apply_compact_visibility(on)
+        if on:
+            self.status.showMessage("Compact Mode on — visualizer, time-travel, EQ sliders hidden. Ctrl+M to exit.", 3500)
+        else:
+            self.status.showMessage("Compact Mode off — all panels restored.", 2500)
+        self._save_magic_state()
+
+    def _on_toggle_visualizer(self, on: bool) -> None:
+        self.viz_panel.setVisible(on)
+        self.status.showMessage(f"Visualizer {'shown' if on else 'hidden'}.", 1500)
+
+    def _on_toggle_eq_sliders(self, on: bool) -> None:
+        self.eq_sliders_container.setVisible(on)
+        self.status.showMessage(f"EQ sliders {'shown' if on else 'hidden'}.", 1500)
+
+    def _on_toggle_time_travel(self, on: bool) -> None:
+        self.time_travel_widget.setVisible(on)
+        self.status.showMessage(f"Time-Travel {'shown' if on else 'hidden'}.", 1500)
+
+    def _on_reset_layout(self) -> None:
+        """Restore all panels to their default visibility and exit Compact Mode."""
+        if self.compact_action.isChecked():
+            self.compact_action.setChecked(False)  # triggers _on_compact_mode_toggled
+        else:
+            # Already off — just make sure everything is visible
+            self._apply_compact_visibility(False)
+        self.status.showMessage("Window layout reset to defaults.", 2000)
 
     # ----------------------------- memory presets -----------------------------
     def _on_memory_tune(self, freq_hz: int, modulation: str) -> None:

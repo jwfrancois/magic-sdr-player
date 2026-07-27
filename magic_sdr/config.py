@@ -97,6 +97,10 @@ class Config:
     # Observer latitude for aurora forecast (Baltimore, MD by default)
     observer_latitude: float = 50.0  # magnetic latitude (~geographic 39° + offset)
 
+    # Compact mode — hides visualizer, time-travel, EQ sliders; shrinks memory
+    # buttons. Toggle with Ctrl+M or the View menu.
+    compact_mode: bool = False
+
     @classmethod
     def load(cls) -> "Config":
         if os.path.exists(CONFIG_FILE):
