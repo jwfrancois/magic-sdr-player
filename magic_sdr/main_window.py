@@ -473,6 +473,40 @@ class MainWindow(QMainWindow):
             col.addWidget(gain_lbl)
             self.eq_sliders_row.addLayout(col)
         eq_outer.addWidget(self.eq_sliders_container)
+
+        # Pre-EQ gain + limiter row — drives the EQ harder and prevents clipping
+        pre_limiter_row = QHBoxLayout()
+        pre_limiter_row.setSpacing(8)
+        # Pre-EQ gain
+        pre_limiter_row.addWidget(QLabel("Pre:"))
+        self.pre_gain_slider = QSlider(Qt.Horizontal)
+        self.pre_gain_slider.setRange(-20, 20)
+        self.pre_gain_slider.setValue(0)
+        self.pre_gain_slider.setTickPosition(QSlider.TicksBelow)
+        self.pre_gain_slider.setTickInterval(5)
+        self.pre_gain_slider.setToolTip(
+            "Pre-EQ Gain — amplifies (or attenuates) the audio BEFORE the EQ filters.\n"
+            "Positive values drive the EQ harder for more pronounced shaping.\n"
+            "Negative values soften the input for a cleaner tone.\n"
+            "Range: -20 to +20 dB."
+        )
+        self.pre_gain_slider.valueChanged.connect(self._on_pre_gain_changed)
+        pre_limiter_row.addWidget(self.pre_gain_slider, stretch=1)
+        self.pre_gain_label = QLabel("+0 dB")
+        self.pre_gain_label.setStyleSheet("color: #5cd9ff; font-size: 10px; font-family: monospace; min-width: 44px;")
+        self.pre_gain_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        pre_limiter_row.addWidget(self.pre_gain_label)
+        # Limiter toggle
+        self.limiter_chk = QCheckBox("Limiter")
+        self.limiter_chk.setChecked(True)
+        self.limiter_chk.setToolTip(
+            "Brick-wall Limiter — prevents ANY clipping regardless of how hard\n"
+            "you drive the pre-gain or EQ. Ceiling at -0.3 dBFS with 1 ms attack\n"
+            "and 60 ms release. Recommended ON to protect your speakers and ears."
+        )
+        self.limiter_chk.toggled.connect(self._on_limiter_toggled)
+        pre_limiter_row.addWidget(self.limiter_chk)
+        eq_outer.addLayout(pre_limiter_row)
         left_layout.addWidget(self.eq_box)
 
         # Time-Travel audio buffer — rewind up to 30 seconds of live radio
@@ -718,10 +752,14 @@ class MainWindow(QMainWindow):
         rds_box = QGroupBox("RDS (FM Radio Data System)")
         rds_outer = QVBoxLayout(rds_box)
         rds_intro = QLabel(
-            "RDS carries station name (PS), program type (PTY), and radio text (RT) "
-            "on a 57 kHz subcarrier. The 19 kHz stereo pilot is detected from the "
-            "audio; full RDS decoding requires MPX audio output (not available from "
-            "stock Gqrx WFM demodulator)."
+            "RDS carries station name (PS), program type (PTY), program ID (PI), and "
+            "radio text (RT) on a 57 kHz subcarrier.\n\n"
+            "To decode RDS:\n"
+            "  1. In Gqrx, use 'WFM' mode (mono), NOT 'WFM_ST'\n"
+            "  2. Set audio sample rate to 192 kHz (needed for 57 kHz)\n"
+            "  3. Tune to a strong FM station\n\n"
+            "The 19 kHz stereo pilot is always detected. Full RDS decoding "
+            "requires sample rate >= 120 kHz."
         )
         rds_intro.setWordWrap(True)
         rds_intro.setStyleSheet("color: #888; font-size: 10px;")
@@ -731,6 +769,8 @@ class MainWindow(QMainWindow):
         for i, (key, lbl_text) in enumerate([
             ("pilot", "Stereo Pilot:"),
             ("pilot_str", "Pilot Strength:"),
+            ("sync", "RDS Sync:"),
+            ("groups", "Groups Decoded:"),
             ("ps", "Station Name (PS):"),
             ("pty", "Program Type (PTY):"),
             ("pi", "Program ID (PI):"),
@@ -746,10 +786,12 @@ class MainWindow(QMainWindow):
         self.rds_labels = {
             "pilot": rds_grid.itemAtPosition(0, 1).widget(),
             "pilot_str": rds_grid.itemAtPosition(1, 1).widget(),
-            "ps": rds_grid.itemAtPosition(2, 1).widget(),
-            "pty": rds_grid.itemAtPosition(3, 1).widget(),
-            "pi": rds_grid.itemAtPosition(4, 1).widget(),
-            "rt": rds_grid.itemAtPosition(5, 1).widget(),
+            "sync": rds_grid.itemAtPosition(2, 1).widget(),
+            "groups": rds_grid.itemAtPosition(3, 1).widget(),
+            "ps": rds_grid.itemAtPosition(4, 1).widget(),
+            "pty": rds_grid.itemAtPosition(5, 1).widget(),
+            "pi": rds_grid.itemAtPosition(6, 1).widget(),
+            "rt": rds_grid.itemAtPosition(7, 1).widget(),
         }
         rds_outer.addLayout(rds_grid)
         sig_layout.addWidget(rds_box)
@@ -1112,6 +1154,11 @@ class MainWindow(QMainWindow):
             self.eq_preset_combo.setCurrentText(self.config.eq_preset_name)
         else:
             self.eq_preset_combo.setCurrentText("Custom")
+        # Load pre-EQ gain + limiter state
+        self.pre_gain_slider.setValue(int(self.config.eq_pre_gain_db))
+        self.equalizer.set_pre_gain(float(self.config.eq_pre_gain_db))
+        self.limiter_chk.setChecked(self.config.eq_limiter_enabled)
+        self.equalizer.set_limiter_enabled(self.config.eq_limiter_enabled)
 
         # ---- Load visualizer mode ----
         if self.config.visualizer_mode in VISUALIZER_MODES:
@@ -1152,6 +1199,9 @@ class MainWindow(QMainWindow):
         self.config.eq_gains = [float(s.value()) for s in self.eq_sliders]
         self.config.eq_enabled = self.eq_enabled_chk.isChecked()
         self.config.eq_preset_name = self.eq_preset_combo.currentText()
+        # Pre-EQ gain + limiter
+        self.config.eq_pre_gain_db = float(self.pre_gain_slider.value())
+        self.config.eq_limiter_enabled = self.limiter_chk.isChecked()
         # Visualizer mode
         self.config.visualizer_mode = self.audio_visualizer.mode
         # Memory presets — serialize to list of dicts
@@ -1605,6 +1655,21 @@ class MainWindow(QMainWindow):
         self.eq_preset_combo.blockSignals(False)
         self._save_magic_state()
 
+    def _on_pre_gain_changed(self, value: int) -> None:
+        """Pre-EQ gain slider moved."""
+        self.equalizer.set_pre_gain(float(value))
+        sign = "+" if value >= 0 else ""
+        self.pre_gain_label.setText(f"{sign}{value} dB")
+        self._save_magic_state()
+
+    def _on_limiter_toggled(self, enabled: bool) -> None:
+        """Brick-wall limiter toggle."""
+        self.equalizer.set_limiter_enabled(enabled)
+        self.status.showMessage(
+            f"Limiter {'ON' if enabled else 'OFF'}", 1500
+        )
+        self._save_magic_state()
+
     # ----------------------------- visualizer -----------------------------
     def _on_viz_mode_changed(self, mode: str) -> None:
         self.status.showMessage(f"Visualizer: {mode} (right-click visualizer to cycle)", 2000)
@@ -1976,25 +2041,38 @@ class MainWindow(QMainWindow):
     def _update_rds_panel(self) -> None:
         """Periodic refresh of the RDS info panel."""
         info = self.rds_decoder.info
+        # Stereo pilot
         if info.stereo_pilot_detected:
             self.rds_labels["pilot"].setText("✓ Detected (stereo broadcast)")
             self.rds_labels["pilot"].setStyleSheet("color: #3aaa55; font-family: monospace;")
         else:
             self.rds_labels["pilot"].setText("✗ Not detected")
             self.rds_labels["pilot"].setStyleSheet("color: #888; font-family: monospace;")
+        # Pilot strength
         if info.pilot_strength_db is not None:
             self.rds_labels["pilot_str"].setText(f"{info.pilot_strength_db:+.1f} dB above noise")
         else:
             self.rds_labels["pilot_str"].setText("—")
-        # PS, PTY, PI, RT — would come from full RDS decoding, which needs MPX audio
-        self.rds_labels["ps"].setText(info.ps or "— (requires MPX audio)")
+        # RDS sync state
+        sync_text = {
+            "searching": "◐ Searching for RDS signal…",
+            "synced": "✓ Synced — decoding RDS groups",
+            "lost": "✗ Sync lost — searching…",
+        }.get(info.sync_state, info.sync_state)
+        sync_color = "#3aaa55" if info.sync_state == "synced" else "#888"
+        self.rds_labels["sync"].setText(sync_text)
+        self.rds_labels["sync"].setStyleSheet(f"color: {sync_color}; font-family: monospace;")
+        # Groups decoded
+        self.rds_labels["groups"].setText(f"{info.groups_decoded}")
+        # PS, PTY, PI, RT
+        self.rds_labels["ps"].setText(info.ps or "— (waiting for RDS data)")
         self.rds_labels["pty"].setText(
-            info.pty_label or "— (requires MPX audio)"
+            info.pty_label or "— (waiting for RDS data)"
         )
         self.rds_labels["pi"].setText(
-            f"0x{info.pi:04X}" if info.pi is not None else "— (requires MPX audio)"
+            f"0x{info.pi:04X}" if info.pi is not None else "— (waiting for RDS data)"
         )
-        self.rds_labels["rt"].setText(info.rt or "— (requires MPX audio)")
+        self.rds_labels["rt"].setText(info.rt or "— (waiting for RDS data)")
 
     def _tune_to(self, freq_hz: int) -> None:
         if not self.gqrx.is_connected():

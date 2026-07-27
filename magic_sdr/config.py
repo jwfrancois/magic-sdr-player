@@ -101,6 +101,12 @@ class Config:
     # buttons. Toggle with Ctrl+M or the View menu.
     compact_mode: bool = False
 
+    # Pre-EQ gain (dB) — applied before the EQ filters. -20 to +20 dB.
+    eq_pre_gain_db: float = 0.0
+
+    # Brick-wall limiter — prevents clipping regardless of pre-gain/EQ.
+    eq_limiter_enabled: bool = True
+
     @classmethod
     def load(cls) -> "Config":
         if os.path.exists(CONFIG_FILE):

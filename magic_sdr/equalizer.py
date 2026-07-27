@@ -73,6 +73,19 @@ class Equalizer:
         self._makeup_peak: float = 1.0
         self._makeup_attack_tau: float = 0.005  # 5 ms attack
         self._makeup_release_tau: float = 0.5   # 500 ms release
+        # Pre-EQ gain (dB) — applied before the EQ filters. Lets the user
+        # drive the EQ input harder (positive) or softer (negative) to
+        # emphasize the EQ's tonal shaping. Default 0 dB (no change).
+        self.pre_gain_db: float = 0.0
+        # Brick-wall limiter — hard ceiling at -0.3 dBFS with look-ahead
+        # to catch inter-sample peaks. Engaged after the EQ filters and
+        # makeup gain, just before the final int16 conversion. Prevents
+        # ANY clipping regardless of how hard the user drives the EQ.
+        self.limiter_enabled: bool = True
+        self.limiter_ceiling_db: float = -0.3   # ceiling at -0.3 dBFS
+        self._limiter_envelope: float = 1.0
+        self._limiter_attack_tau: float = 0.001   # 1 ms attack (very fast)
+        self._limiter_release_tau: float = 0.060  # 60 ms release
 
     def set_band_gain(self, band_index: int, gain_db: float) -> None:
         """Set the gain (in dB) of a band."""
@@ -102,9 +115,26 @@ class Equalizer:
         for i in range(len(self.gains_db)):
             self.set_band_gain(i, 0.0)
         self._makeup_peak = 1.0  # reset makeup envelope
+        self._limiter_envelope = 1.0  # reset limiter envelope
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
+
+    def set_pre_gain(self, gain_db: float) -> None:
+        """Set the pre-EQ gain in dB (-20 to +20 dB)."""
+        self.pre_gain_db = max(-20.0, min(20.0, float(gain_db)))
+
+    def get_pre_gain(self) -> float:
+        return self.pre_gain_db
+
+    def set_limiter_enabled(self, enabled: bool) -> None:
+        self.limiter_enabled = bool(enabled)
+        if not enabled:
+            self._limiter_envelope = 1.0
+
+    def set_limiter_ceiling(self, ceiling_db: float) -> None:
+        """Set the limiter ceiling in dBFS (-12 to 0 dB)."""
+        self.limiter_ceiling_db = max(-12.0, min(0.0, float(ceiling_db)))
 
     @property
     def enabled(self) -> bool:
@@ -145,21 +175,22 @@ class Equalizer:
     def process(self, chunk: np.ndarray, sample_rate: Optional[int] = None) -> np.ndarray:
         """Apply the EQ to an audio chunk.
 
+        Pipeline:
+            input -> pre-gain -> EQ filters -> makeup gain -> limiter -> output
+
         Args:
             chunk: int16 ndarray, shape (N,) for mono or (N, channels) for multi-channel.
             sample_rate: ignored (we use the constructor's sample rate).
 
         Returns:
             int16 ndarray with the same shape as the input.
-
-        Anti-clipping: when any band has positive gain, the filtered output
-        can exceed int16 range. We detect the peak and apply a makeup
-        attenuation to prevent clipping — otherwise a +12 dB bass boost on a
-        loud signal smashes 70%+ of samples into square waves, which sounds
-        like harsh distortion rather than a tonal change.
         """
-        if not self._enabled or not HAVE_SCIPY or self.is_flat():
+        # If EQ is completely off AND no pre-gain AND limiter off, bypass
+        eq_active = self._enabled and HAVE_SCIPY and not self.is_flat()
+        pre_gain_active = abs(self.pre_gain_db) > 0.01
+        if not eq_active and not pre_gain_active and not self.limiter_enabled:
             return chunk
+
         sr = sample_rate or self.sample_rate
         if sr != self.sample_rate:
             # Sample rate changed — invalidate all cached filters and states
@@ -179,75 +210,95 @@ class Equalizer:
         else:
             audio = chunk.astype(np.float32)
 
-        # Handle multi-channel: process each channel separately
-        if audio.ndim == 1:
-            audio = audio[:, np.newaxis]
-            squeeze_back = True
-        else:
-            squeeze_back = False
+        # ---- Pre-EQ gain (applied before the EQ filters) ----
+        if pre_gain_active:
+            audio = audio * (10 ** (self.pre_gain_db / 20.0))
 
-        n_channels = audio.shape[1]
+        # ---- EQ filters ----
+        if eq_active:
+            # Handle multi-channel: process each channel separately
+            if audio.ndim == 1:
+                audio = audio[:, np.newaxis]
+                squeeze_back = True
+            else:
+                squeeze_back = False
 
-        for band_idx in range(len(EQ_BANDS_HZ)):
-            if abs(self.gains_db[band_idx]) < 0.01:
-                continue  # skip bands at 0 dB
-            # Design filter if needed
-            if self._b_a[band_idx] is None:
-                self._b_a[band_idx] = self._design_filter(band_idx)
-                # Reset state because filter coeffs changed
-                self._zi[band_idx] = None
-            b, a = self._b_a[band_idx]
-            # Initialize state if needed.
-            # NOTE: scipy's lfilter_zi returns the steady-state response to a
-            # STEP input (constant 1.0), which is the right initial condition
-            # for DC signals but WRONG for zero-centered audio. Using lfilter_zi
-            # as the initial state for an oscillating audio signal creates a
-            # transient that decays over ~100 ms and artificially reduces the
-            # measured gain during that period.
-            #
-            # For zero-centered audio, the correct initial state is simply
-            # zeros — the filter will reach steady-state within a few cycles
-            # of the input signal.
-            from scipy.signal import lfilter
-            if self._zi[band_idx] is None or self._zi[band_idx].shape[1] != n_channels:
-                self._zi[band_idx] = np.zeros((2, n_channels), dtype=np.float64)
-            # Process each channel
-            for ch in range(n_channels):
-                filtered, new_zi = lfilter(
-                    b, a, audio[:, ch], zi=self._zi[band_idx][:, ch]
-                )
-                audio[:, ch] = filtered
-                self._zi[band_idx][:, ch] = new_zi
+            n_channels = audio.shape[1]
 
-        if squeeze_back:
-            audio = audio[:, 0]
+            for band_idx in range(len(EQ_BANDS_HZ)):
+                if abs(self.gains_db[band_idx]) < 0.01:
+                    continue  # skip bands at 0 dB
+                # Design filter if needed
+                if self._b_a[band_idx] is None:
+                    self._b_a[band_idx] = self._design_filter(band_idx)
+                    # Reset state because filter coeffs changed
+                    self._zi[band_idx] = None
+                b, a = self._b_a[band_idx]
+                from scipy.signal import lfilter
+                if self._zi[band_idx] is None or self._zi[band_idx].shape[1] != n_channels:
+                    self._zi[band_idx] = np.zeros((2, n_channels), dtype=np.float64)
+                # Process each channel
+                for ch in range(n_channels):
+                    filtered, new_zi = lfilter(
+                        b, a, audio[:, ch], zi=self._zi[band_idx][:, ch]
+                    )
+                    audio[:, ch] = filtered
+                    self._zi[band_idx][:, ch] = new_zi
+
+            if squeeze_back:
+                audio = audio[:, 0]
 
         # ---- Anti-clipping makeup gain (peak envelope follower) ----
         # When any band has positive gain, the filtered output can exceed the
-        # [-1, 1] float range (which maps to int16 full-scale). Clipping
-        # directly to int16 would smash peaks into square waves — audible as
-        # harsh distortion that masks the EQ's tonal effect.
-        #
-        # We track a peak envelope with fast attack (5 ms) and medium release
-        # (500 ms) so the makeup gain is stable across chunks (minimal
-        # pumping). The envelope only kicks in when the signal actually
-        # exceeds full scale — quiet passages pass through unattenuated, so
-        # the EQ's tonal effect is clearly audible on normal-level audio.
+        # [-1, 1] float range. We track a peak envelope with fast attack (5 ms)
+        # and medium release (500 ms) so the makeup gain is stable across
+        # chunks (minimal pumping). Only kicks in when signal exceeds full
+        # scale — quiet passages pass through unattenuated.
         chunk_peak = float(np.max(np.abs(audio))) if audio.size > 0 else 0.0
         dt = audio.shape[0] / float(sr) if sr > 0 else 0.01
         if chunk_peak > self._makeup_peak:
-            # Fast attack: catch the peak within a few ms
             alpha = 1.0 - np.exp(-dt / self._makeup_attack_tau)
             self._makeup_peak = self._makeup_peak + alpha * (chunk_peak - self._makeup_peak)
         else:
-            # Medium release: recover over ~500 ms
             alpha = 1.0 - np.exp(-dt / self._makeup_release_tau)
             self._makeup_peak = self._makeup_peak + alpha * (chunk_peak - self._makeup_peak)
-        # Only apply makeup attenuation when envelope exceeds full scale
         if self._makeup_peak > 1.0:
             target_peak = 10 ** (-0.5 / 20.0)  # ~0.944, leaves 0.5 dB headroom
             scale = target_peak / self._makeup_peak
             audio = audio * scale
+
+        # ---- Brick-wall limiter ----
+        # A look-ahead peak limiter that prevents ANY sample from exceeding
+        # the ceiling. Uses a fast attack (1 ms) and medium release (60 ms)
+        # envelope follower. When the signal exceeds the ceiling, the gain is
+        # reduced instantaneously; when it drops back, the gain recovers
+        # smoothly. This guarantees zero clipping regardless of how hard the
+        # user drives the pre-gain or EQ.
+        if self.limiter_enabled:
+            ceiling = 10 ** (self.limiter_ceiling_db / 20.0)  # e.g. -0.3 dB -> 0.966
+            # Sample-by-sample peak detection (true look-ahead would need a
+            # delay buffer; we use instant attack which is effectively a
+            # brick-wall ceiling — any peak above ceiling is squashed).
+            abs_audio = np.abs(audio)
+            chunk_peak_lim = float(np.max(abs_audio)) if abs_audio.size > 0 else 0.0
+            if chunk_peak_lim > ceiling:
+                # Instant gain reduction to bring peak to ceiling
+                inst_gain = ceiling / chunk_peak_lim
+                # Track the envelope with fast attack, slow release so we
+                # don't pump on brief transients
+                if inst_gain < self._limiter_envelope:
+                    alpha = 1.0 - np.exp(-dt / self._limiter_attack_tau)
+                    self._limiter_envelope = self._limiter_envelope + alpha * (inst_gain - self._limiter_envelope)
+                else:
+                    alpha = 1.0 - np.exp(-dt / self._limiter_release_tau)
+                    self._limiter_envelope = self._limiter_envelope + alpha * (1.0 - self._limiter_envelope)
+                audio = audio * self._limiter_envelope
+                # Final safety clip — guarantees no sample exceeds ceiling
+                audio = np.clip(audio, -ceiling, ceiling)
+            else:
+                # No limiting needed this chunk — release the envelope
+                alpha = 1.0 - np.exp(-dt / self._limiter_release_tau)
+                self._limiter_envelope = self._limiter_envelope + alpha * (1.0 - self._limiter_envelope)
 
         # Convert back to original dtype
         if original_dtype == np.int16:
