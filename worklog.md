@@ -498,3 +498,37 @@ Stage Summary:
 - Left panel now scrolls if window is too short — no more clipped EQ/Time-Travel
 - Window won't resize below 900x640
 - Changes live on GitHub main branch
+
+---
+Task ID: compact-mode
+Agent: main
+Task: Add a Compact Mode toggle to the Magic SDR Player
+
+Work Log:
+- Added compact_mode: bool field to Config (default False, persisted)
+- Added QKeySequence, QAction, QShortcut to main_window.py imports
+- Refactored EQ sliders: wrapped 10 slider columns in eq_sliders_container QWidget (was bare QHBoxLayout) for clean setVisible() toggling
+- Refactored visualizer: wrapped label + mode combo + canvas in viz_panel QWidget
+- Built View menu with 5 actions:
+  - Compact Mode (Ctrl+M, checkable) — hides viz + time-travel + EQ sliders, shrinks memory buttons
+  - Show Visualizer (checkable) — individual toggle
+  - Show EQ Sliders (checkable) — individual toggle (preset dropdown always stays)
+  - Show Time-Travel (checkable) — individual toggle
+  - Reset Window Layout — restores all defaults, exits compact
+- _apply_compact_visibility(on): side-effect-free helper that shows/hides all 3 panels + resizes memory buttons + syncs sub-toggle checkboxes (signals blocked)
+- _on_compact_mode_toggled(on): menu handler — calls _apply_compact_visibility, shows status message, saves config
+- _on_toggle_visualizer/_on_toggle_eq_sliders/_on_toggle_time_travel: individual panel toggles
+- _on_reset_layout: exits compact + restores all panels
+- _apply_config: restores saved compact_mode at startup silently (blockSignals on checkbox, no status message)
+- _save_magic_state: compact_mode persisted via config.save()
+- Wrote offscreen test: verified initial state, compact on/off, sub-toggle while compact, reset layout, save/reload round-trip — ALL PASSED
+- Rebuilt download/magic_sdr_player.zip (164K)
+- Committed ce097aa, pushed to GitHub
+
+Stage Summary:
+- Compact Mode accessible via View menu or Ctrl+M
+- Hides: visualizer panel, time-travel bar, EQ sliders (keeps preset dropdown)
+- Shrinks: memory preset buttons from 40x72 to 30x60
+- Individual panels can be re-enabled even while compact is on
+- Reset Window Layout restores everything in one click
+- State persists across app restarts
