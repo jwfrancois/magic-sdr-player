@@ -52,5 +52,6 @@
   "dx_cluster_enabled": true,
   "night_vision": true,
   "time_travel_live": true,
-  "observer_latitude": 50.0
+  "observer_latitude": 50.0,
+  "compact_mode": false
 }

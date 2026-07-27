@@ -66,6 +66,13 @@ class Equalizer:
         # Cached filter coefficients (recomputed only when gain changes)
         self._b_a: List[Optional[Tuple[np.ndarray, np.ndarray]]] = [None] * len(EQ_BANDS_HZ)
         self._enabled = True
+        # Makeup-gain peak envelope (fast-attack, medium-release) to prevent
+        # chunk-to-chunk loudness pumping. Holds the recent peak in float
+        # amplitude (1.0 = full scale). Only attenuates when signal exceeds
+        # full scale, so quiet passages pass through uncolored.
+        self._makeup_peak: float = 1.0
+        self._makeup_attack_tau: float = 0.005  # 5 ms attack
+        self._makeup_release_tau: float = 0.5   # 500 ms release
 
     def set_band_gain(self, band_index: int, gain_db: float) -> None:
         """Set the gain (in dB) of a band."""
@@ -94,6 +101,7 @@ class Equalizer:
         """Reset all gains to 0 dB (flat)."""
         for i in range(len(self.gains_db)):
             self.set_band_gain(i, 0.0)
+        self._makeup_peak = 1.0  # reset makeup envelope
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
@@ -143,6 +151,12 @@ class Equalizer:
 
         Returns:
             int16 ndarray with the same shape as the input.
+
+        Anti-clipping: when any band has positive gain, the filtered output
+        can exceed int16 range. We detect the peak and apply a makeup
+        attenuation to prevent clipping — otherwise a +12 dB bass boost on a
+        loud signal smashes 70%+ of samples into square waves, which sounds
+        like harsh distortion rather than a tonal change.
         """
         if not self._enabled or not HAVE_SCIPY or self.is_flat():
             return chunk
@@ -207,6 +221,33 @@ class Equalizer:
 
         if squeeze_back:
             audio = audio[:, 0]
+
+        # ---- Anti-clipping makeup gain (peak envelope follower) ----
+        # When any band has positive gain, the filtered output can exceed the
+        # [-1, 1] float range (which maps to int16 full-scale). Clipping
+        # directly to int16 would smash peaks into square waves — audible as
+        # harsh distortion that masks the EQ's tonal effect.
+        #
+        # We track a peak envelope with fast attack (5 ms) and medium release
+        # (500 ms) so the makeup gain is stable across chunks (minimal
+        # pumping). The envelope only kicks in when the signal actually
+        # exceeds full scale — quiet passages pass through unattenuated, so
+        # the EQ's tonal effect is clearly audible on normal-level audio.
+        chunk_peak = float(np.max(np.abs(audio))) if audio.size > 0 else 0.0
+        dt = audio.shape[0] / float(sr) if sr > 0 else 0.01
+        if chunk_peak > self._makeup_peak:
+            # Fast attack: catch the peak within a few ms
+            alpha = 1.0 - np.exp(-dt / self._makeup_attack_tau)
+            self._makeup_peak = self._makeup_peak + alpha * (chunk_peak - self._makeup_peak)
+        else:
+            # Medium release: recover over ~500 ms
+            alpha = 1.0 - np.exp(-dt / self._makeup_release_tau)
+            self._makeup_peak = self._makeup_peak + alpha * (chunk_peak - self._makeup_peak)
+        # Only apply makeup attenuation when envelope exceeds full scale
+        if self._makeup_peak > 1.0:
+            target_peak = 10 ** (-0.5 / 20.0)  # ~0.944, leaves 0.5 dB headroom
+            scale = target_peak / self._makeup_peak
+            audio = audio * scale
 
         # Convert back to original dtype
         if original_dtype == np.int16:
