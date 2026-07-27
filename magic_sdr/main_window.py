@@ -477,6 +477,24 @@ class MainWindow(QMainWindow):
         # HiFi EQ — 10-band graphic equalizer + 16 named presets
         self.eq_box = QGroupBox("HiFi Equalizer (10-band)")
         eq_outer = QVBoxLayout(self.eq_box)
+        # scipy availability check — if scipy is missing, the EQ filters
+        # can't run and the sliders will have no audible effect. Show a
+        # clear warning so the user knows to install scipy.
+        try:
+            import scipy  # noqa: F401
+            self._scipy_available = True
+        except ImportError:
+            self._scipy_available = False
+            scipy_warn = QLabel(
+                "⚠ scipy not installed — EQ filters won't work.\n"
+                "Install with: pip install scipy"
+            )
+            scipy_warn.setStyleSheet(
+                "color: #ff5c5c; font-size: 10px; font-family: monospace; "
+                "background: #3a2222; padding: 4px; border-radius: 3px;"
+            )
+            scipy_warn.setWordWrap(True)
+            eq_outer.addWidget(scipy_warn)
         # EQ enable checkbox + preset dropdown + reset button
         eq_top_row = QHBoxLayout()
         self.eq_enabled_chk = QCheckBox("Enabled")
@@ -2279,6 +2297,8 @@ class MainWindow(QMainWindow):
         self.config.volume = vol
         if hasattr(self, "vol_pct_label"):
             self.vol_pct_label.setText(f"{v}%")
+        # Update audio status immediately so user sees the change
+        self._update_audio_status_label()
 
     def _on_mute_toggled(self, muted: bool) -> None:
         self.audio_player.set_muted(muted)
@@ -2407,17 +2427,23 @@ class MainWindow(QMainWindow):
             pushed = self.audio_player.pushed_count()
             pulled = self.audio_player.pulled_count()
             dev = self.audio_player.device_name()
+            vol = int(self.audio_player.get_volume() * 100)
             if pulled == 0 and pushed > 5:
                 # Callback thread isn't draining — stream may be dead
                 self.audio_status_lbl.setText(
-                    f"Audio: BROKEN (pushed {pushed}, pulled 0) on {dev}"
+                    f"Audio: BROKEN (pushed {pushed}, pulled 0) on {dev} | vol {vol}%"
                 )
                 self.audio_status_lbl.setStyleSheet(
                     "color: #ff5c5c; font-family: monospace; font-size: 10px;"
                 )
             else:
+                # Check if EQ is actually processing (scipy + non-flat)
+                eq_status = "EQ: OFF" if not self._scipy_available else (
+                    "EQ: FLAT" if self.equalizer.is_flat() else "EQ: ACTIVE"
+                )
                 self.audio_status_lbl.setText(
-                    f"Audio: PLAYING on {dev}  (pushed {pushed}, pulled {pulled})"
+                    f"Audio: PLAYING on {dev} | vol {vol}% | {eq_status} "
+                    f"| pushed {pushed} pulled {pulled}"
                 )
                 self.audio_status_lbl.setStyleSheet(
                     "color: #5cffaa; font-family: monospace; font-size: 10px;"

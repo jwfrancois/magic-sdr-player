@@ -830,3 +830,61 @@ Stage Summary:
 - Volume slider still works as a percentage on top of the output gain
 - No more distortion from the limiter (ceiling lowered from -0.3 to -3 dBFS)
 - All defaults are conservative; user can boost if they want louder audio
+
+---
+Task ID: fix-volume-eq-not-working
+Agent: main
+Task: Fix "the app's volume and the EQ don't work at all"
+
+Root Cause:
+- Volume was applied in push() BEFORE the chunk was queued
+- When user moved the volume slider, only NEW chunks got the new volume
+- Chunks already in the queue (up to 64 chunks = ~1.4s of audio) played
+  at the OLD volume
+- This made the volume slider feel non-functional — user dragged it and
+  nothing changed for over a second, by which time they'd given up
+- The EQ itself was working correctly, but the user couldn't hear the
+  tonal changes because the volume was stuck at the old level
+
+Fix (magic_sdr/audio_receiver.py + main_window.py):
+
+1. MOVED VOLUME APPLICATION from push() to _callback():
+   - push() now just queues the raw chunk (no volume applied)
+   - _callback() applies volume at PLAYBACK TIME
+   - Volume changes now take effect on the NEXT callback (immediately)
+   - Mute also takes effect immediately
+   - Test confirmed: old behavior played queued chunks at old volume
+     (peak 1000 instead of expected 100); new behavior plays at new
+     volume immediately
+
+2. ADDED SCIPY AVAILABILITY CHECK in EQ panel:
+   - If scipy is not installed, shows a red warning:
+     "⚠ scipy not installed — EQ filters won't work.
+      Install with: pip install scipy"
+   - Without scipy, the EQ sliders have NO audible effect (the EQ
+     degrades to pass-through), so the user needs to know
+
+3. ENHANCED AUDIO STATUS LABEL to show:
+   - Current volume percentage (e.g., "vol 50%")
+   - EQ state: "EQ: OFF" (scipy missing) / "EQ: FLAT" / "EQ: ACTIVE"
+   - Push/pull counters for debugging
+   - Updates immediately when volume slider changes (not just every 1.5s)
+
+4. Volume slider now triggers _update_audio_status_label() on change
+   so the user sees immediate feedback
+
+Verification:
+- test_volume_standalone.py: 3/3 tests pass
+  - Volume change takes effect immediately (peak 100, not 1000)
+  - Old behavior confirmed broken (peak 1000 when should be 100)
+  - Mute takes effect immediately (peak 0)
+- test_volume_responsive.py: source code checks pass
+- python3 -m py_compile: both files compile cleanly
+
+Stage Summary:
+- Volume slider now responds IMMEDIATELY (was delayed by up to 1.4s)
+- Mute button now responds immediately
+- EQ sliders work correctly (already did, but user couldn't hear it
+  because volume was stuck)
+- Clear warning shown if scipy is not installed
+- Audio status label shows volume %, EQ state, and chunk flow counters

@@ -265,15 +265,17 @@ class AudioPlayer:
             self._sd_stream = None
 
     def push(self, chunk: np.ndarray) -> None:
-        """Accept a chunk (int16) for playback. Drops if buffer is full."""
+        """Accept a chunk (int16) for playback. Drops if buffer is full.
+
+        NOTE: Volume is NOT applied here — it's applied in the callback at
+        playback time. This means volume changes take effect immediately,
+        even for chunks already in the queue. (Previous version applied
+        volume here, which meant volume changes only affected NEW chunks,
+        making the volume slider feel unresponsive or non-functional.)
+        """
         if not self._running:
             return
         self._pushed_count += 1
-        # Apply volume
-        if self._muted or self._volume == 0.0:
-            chunk = np.zeros_like(chunk)
-        elif self._volume < 1.0:
-            chunk = (chunk.astype(np.float32) * self._volume).astype(np.int16)
         try:
             self._q.put_nowait(chunk)
         except queue.Full:
@@ -295,6 +297,13 @@ class AudioPlayer:
         # Reshape if needed
         if self.channels == 2 and chunk.ndim == 1:
             chunk = np.column_stack([chunk, chunk])
+        # Apply volume HERE (at playback time) so changes take effect
+        # immediately, even for chunks already in the queue.
+        if self._muted or self._volume == 0.0:
+            outdata.fill(0)
+            return
+        if self._volume < 1.0:
+            chunk = (chunk.astype(np.float32) * self._volume).astype(np.int16)
         # Fit to requested frames
         n = min(len(chunk), frames)
         outdata[:n] = chunk[:n]
