@@ -570,3 +570,69 @@ Stage Summary:
 - No clipping distortion on any preset
 - Quiet audio passes through without unnecessary attenuation
 - Committed df45198, pushed to GitHub
+
+---
+Task ID: pre-gain-limiter-rds
+Agent: main
+Task: Add pre-EQ gain control, brick-wall limiter, and implement real RDS decoding
+
+Work Log:
+
+PRE-EQ GAIN CONTROL:
+- Added pre_gain_db field to Equalizer (-20 to +20 dB, default 0)
+- Applied BEFORE the EQ filters in the process() pipeline
+- Added set_pre_gain()/get_pre_gain() methods
+- Added horizontal slider + label to EQ panel UI
+- Persisted in config as eq_pre_gain_db
+
+BRICK-WALL LIMITER:
+- Added limiter_enabled (default True) and limiter_ceiling_db (-0.3 dBFS)
+- Peak envelope follower: 1 ms attack, 60 ms release
+- Applied AFTER EQ filters and makeup gain, BEFORE int16 conversion
+- Guarantees zero clipping regardless of pre-gain/EQ settings
+- Added 'Limiter' checkbox to EQ panel UI
+- Added set_limiter_enabled()/set_limiter_ceiling() methods
+- Persisted in config as eq_limiter_enabled
+
+REAL RDS DECODER (magic_sdr/rds.py — full rewrite):
+- RDSBlockDecoder class: syndrome computation (polynomial division by
+  g(x)=0x5B9), block identification via offset words, sync search
+  (slides bit-by-bit until valid offset word found), group assembly
+- RDSGroupInterpreter class: extracts PS (8 chars across 4 type-0A
+  groups), PTY, PI, RT (type 2A/2B)
+- RDSDecoder.process_audio(): full demodulation pipeline:
+  1. Bandpass 57 kHz (FIR 129 taps, ±2.4 kHz)
+  2. Extract 19 kHz pilot, cube, bandpass to 57 kHz reference
+  3. Normalize reference (hard limiter)
+  4. Mix RDS subcarrier with reference -> baseband BPSK
+  5. Lowpass (cutoff 2400 Hz)
+  6. Integrate-and-dump at 1187.5 Hz
+  7. Hard decision -> bits -> block decoder
+- Falls back to pilot detection when sample rate < 120 kHz
+- Updated RDS panel UI: added sync state, groups decoded counter,
+  clear instructions for getting MPX audio from Gqrx
+
+VERIFICATION:
+- test_pre_gain_limiter.py: all 5 tests pass (pre-gain boosts/attenuates,
+  limiter prevents clipping at -0.5 dBFS, ceiling adjustment works)
+- test_rds_block_decoder.py: block decoder correctly recovers PS/PI/PTY
+  from known bit patterns — PROVEN CORRECT
+- test_rds_syndrome.py: syndrome computation verified (0x3CD for block A)
+- functional_test.py: all tests pass
+- Pre-gain/limiter UI test: slider, label, checkbox, persistence all work
+
+RDS DEMODULATION STATUS:
+- Block decoder: WORKING (proven via test_rds_block_decoder.py)
+- Pilot detection: WORKING (detected at all sample rates >= 48 kHz)
+- BPSK demodulation: PARTIALLY WORKING — the pilot-coherent approach
+  (cube pilot -> 57 kHz reference) is implemented but bit-timing
+  recovery needs a Costas loop for reliable real-world decoding.
+  The decoder will show 'searching' until sync is achieved.
+
+Stage Summary:
+- Pre-EQ gain: -20 to +20 dB, drives EQ harder for more pronounced shaping
+- Brick-wall limiter: zero clipping, protects speakers/ears
+- RDS: full demodulator pipeline + block decoder + group interpreter
+  (block decoder proven correct; demod needs further work for real signals)
+- All features persisted in config, all functional tests pass
+- Committed 2ef9edf, pushed to GitHub
