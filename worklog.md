@@ -757,3 +757,76 @@ Stage Summary:
   (plays a 440Hz tone through the full pipeline)
 - Audio status label shows real-time pipeline state (PLAYING / OFFLINE
   / BROKEN) with device name and push/pull counters
+
+---
+Task ID: fix-loud-and-noisy
+Agent: main
+Task: Fix "When I muted Gqrx, the app's sound is loud and noisy with no way to turn it down"
+
+Root Cause:
+- The EQ pipeline was MAXIMIZING loudness:
+  1. Makeup gain target was -0.5 dBFS (0.944 amplitude) — near full scale
+  2. Brick-wall limiter ceiling was -0.3 dBFS (0.966) — essentially hard
+     clipping on every peak → harsh distortion ("noisy")
+  3. Default volume was 0.8 (80%) — at 80% of -0.5 dBFS, audio was
+     still deafening
+- The volume slider DID work, but at 80% of an already-maximized signal,
+  it was still extremely loud
+- The user perceived "no way to turn it down" because the slider at
+  default 80% didn't make a meaningful difference
+
+Fix (magic_sdr/equalizer.py + config.py + main_window.py):
+
+1. ADDED OUTPUT GAIN CONTROL (master loudness):
+   - New field: output_gain_db (default -6 dB, range -60 to 0 dB)
+   - Applied AFTER the limiter, BEFORE int16 conversion
+   - This is the PRIMARY loudness control — separate from the
+     percentage volume slider
+   - New methods: set_output_gain(), get_output_gain()
+
+2. LOWERED MAKEUP GAIN TARGET from -0.5 dBFS to -6 dBFS:
+   - Was: target_peak = 10^(-0.5/20) = 0.944 (near full scale)
+   - Now: target_peak = 10^(-6/20) = 0.501 (half amplitude)
+   - Result: EQ output is no longer maximized to near-clipping
+
+3. LOWERED DEFAULT LIMITER CEILING from -0.3 dBFS to -3 dBFS:
+   - Was: 0.966 amplitude (hard clipping on every peak → distortion)
+   - Now: 0.708 amplitude (more headroom, less distortion)
+   - Updated tooltip to reflect new ceiling
+
+4. LOWERED DEFAULT VOLUME from 0.8 to 0.5:
+   - Combined with -6 dB output gain + -6 dBFS makeup target,
+     default listening level is now ~-18 dBFS (comfortable)
+
+5. ADDED OUTPUT GAIN SLIDER in EQ panel UI:
+   - Range: -60 to 0 dB, default -6 dB, tick interval 6 dB
+   - Bold orange label showing current value (e.g., "-6 dB")
+   - Tooltip explains: "USE THIS to make the app louder or quieter"
+   - Persists in config as eq_output_gain_db
+
+6. IMPROVED VOLUME SLIDER:
+   - Added percentage label (e.g., "50%")
+   - Updated tooltip to point users to the Out: slider for loudness control
+   - Now visible at a glance what % the user is at
+
+7. PERSISTED limiter_ceiling_db in config (was hardcoded)
+
+Verification:
+- test_output_gain.py: 9/9 tests pass
+  - Output gain default is -6 dB
+  - Output gain attenuates audio correctly (-20 dB → 0.1x amplitude)
+  - Output gain can make audio louder (-6 → 0 dB → 2x amplitude)
+  - Makeup gain target is now -6 dBFS (was -0.5)
+  - Limiter ceiling default is -3 dBFS (was -0.3)
+  - Default volume is 0.5 (was 0.8)
+  - Output gain persisted in config
+  - Output gain UI slider properly defined
+  - No clipping with default settings + Bass Boost preset
+    (output peak 8230 vs input 32762, 0% clipping)
+
+Stage Summary:
+- App is no longer deafening on first launch
+- User has a clear "Out:" slider in the EQ panel for loudness control
+- Volume slider still works as a percentage on top of the output gain
+- No more distortion from the limiter (ceiling lowered from -0.3 to -3 dBFS)
+- All defaults are conservative; user can boost if they want louder audio

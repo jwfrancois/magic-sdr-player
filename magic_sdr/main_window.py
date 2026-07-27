@@ -354,8 +354,19 @@ class MainWindow(QMainWindow):
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(int(self.config.volume * 100))
+        self.vol_slider.setToolTip(
+            "Volume — percentage of the EQ output to send to the speakers.\n"
+            "For overall loudness control, prefer the 'Out:' gain slider in\n"
+            "the EQ panel above (it has a dB scale and more range)."
+        )
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
         vol_row.addWidget(self.vol_slider, stretch=1)
+        self.vol_pct_label = QLabel(f"{int(self.config.volume * 100)}%")
+        self.vol_pct_label.setStyleSheet(
+            "color: #5cd9ff; font-size: 10px; font-family: monospace; min-width: 32px;"
+        )
+        self.vol_pct_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        vol_row.addWidget(self.vol_pct_label)
         self.mute_btn = QPushButton("🔊")
         self.mute_btn.setFixedWidth(40)
         self.mute_btn.setCheckable(True)
@@ -545,12 +556,43 @@ class MainWindow(QMainWindow):
         self.limiter_chk.setChecked(True)
         self.limiter_chk.setToolTip(
             "Brick-wall Limiter — prevents ANY clipping regardless of how hard\n"
-            "you drive the pre-gain or EQ. Ceiling at -0.3 dBFS with 1 ms attack\n"
-            "and 60 ms release. Recommended ON to protect your speakers and ears."
+            "you drive the pre-gain or EQ. Ceiling at -3 dBFS with 1 ms attack\n"
+            "and 60 ms release. Recommended ON to protect your speakers and ears.\n\n"
+            "Note: To control LOUDNESS, use the 'Out:' slider below, not the limiter."
         )
         self.limiter_chk.toggled.connect(self._on_limiter_toggled)
         pre_limiter_row.addWidget(self.limiter_chk)
         eq_outer.addLayout(pre_limiter_row)
+
+        # ---- Output gain (MASTER loudness control) ----
+        # This is the user's primary "make it louder / quieter" control.
+        # Applied AFTER the limiter, so it doesn't affect clipping behavior.
+        # Default -6 dB. Range -60 to 0 dB.
+        output_row = QHBoxLayout()
+        output_row.addWidget(QLabel("Out:"))
+        self.output_gain_slider = QSlider(Qt.Horizontal)
+        self.output_gain_slider.setRange(-60, 0)
+        self.output_gain_slider.setValue(-6)
+        self.output_gain_slider.setTickPosition(QSlider.TicksBelow)
+        self.output_gain_slider.setTickInterval(6)
+        self.output_gain_slider.setToolTip(
+            "Output Gain — the MASTER loudness control.\n"
+            "Applied after the limiter, before playback.\n\n"
+            "USE THIS to make the app louder or quieter.\n"
+            "Does NOT affect the EQ's tonal shaping.\n\n"
+            "Range: -60 dB (silent) to 0 dB (max).\n"
+            "Default: -6 dB (comfortable listening level)."
+        )
+        self.output_gain_slider.valueChanged.connect(self._on_output_gain_changed)
+        output_row.addWidget(self.output_gain_slider, stretch=1)
+        self.output_gain_label = QLabel("-6 dB")
+        self.output_gain_label.setStyleSheet(
+            "color: #ffaa5c; font-size: 10px; font-family: monospace; min-width: 52px; font-weight: bold;"
+        )
+        self.output_gain_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        output_row.addWidget(self.output_gain_label)
+        eq_outer.addLayout(output_row)
+
         left_layout.addWidget(self.eq_box)
 
         # Time-Travel audio buffer — rewind up to 30 seconds of live radio
@@ -1198,11 +1240,18 @@ class MainWindow(QMainWindow):
             self.eq_preset_combo.setCurrentText(self.config.eq_preset_name)
         else:
             self.eq_preset_combo.setCurrentText("Custom")
-        # Load pre-EQ gain + limiter state
+        # Load pre-EQ gain + limiter state + output gain
         self.pre_gain_slider.setValue(int(self.config.eq_pre_gain_db))
         self.equalizer.set_pre_gain(float(self.config.eq_pre_gain_db))
         self.limiter_chk.setChecked(self.config.eq_limiter_enabled)
         self.equalizer.set_limiter_enabled(self.config.eq_limiter_enabled)
+        # Output gain (master loudness) — load from config, default -6 dB
+        out_gain = float(getattr(self.config, "eq_output_gain_db", -6.0))
+        self.output_gain_slider.setValue(int(out_gain))
+        self.equalizer.set_output_gain(out_gain)
+        # Limiter ceiling — load from config, default -3 dBFS
+        ceil_db = float(getattr(self.config, "eq_limiter_ceiling_db", -3.0))
+        self.equalizer.set_limiter_ceiling(ceil_db)
 
         # ---- Load visualizer mode ----
         if self.config.visualizer_mode in VISUALIZER_MODES:
@@ -1243,9 +1292,11 @@ class MainWindow(QMainWindow):
         self.config.eq_gains = [float(s.value()) for s in self.eq_sliders]
         self.config.eq_enabled = self.eq_enabled_chk.isChecked()
         self.config.eq_preset_name = self.eq_preset_combo.currentText()
-        # Pre-EQ gain + limiter
+        # Pre-EQ gain + limiter + output gain
         self.config.eq_pre_gain_db = float(self.pre_gain_slider.value())
         self.config.eq_limiter_enabled = self.limiter_chk.isChecked()
+        self.config.eq_output_gain_db = float(self.output_gain_slider.value())
+        self.config.eq_limiter_ceiling_db = float(self.equalizer.limiter_ceiling_db)
         # Visualizer mode
         self.config.visualizer_mode = self.audio_visualizer.mode
         # Memory presets — serialize to list of dicts
@@ -1772,6 +1823,17 @@ class MainWindow(QMainWindow):
         )
         self._save_magic_state()
 
+    def _on_output_gain_changed(self, value: int) -> None:
+        """Master output gain slider moved.
+
+        This is the PRIMARY loudness control. Applied after the limiter.
+        Use this to make the app louder or quieter without affecting
+        the EQ's tonal shaping.
+        """
+        self.equalizer.set_output_gain(float(value))
+        self.output_gain_label.setText(f"{value} dB")
+        self._save_magic_state()
+
     # ----------------------------- visualizer -----------------------------
     def _on_viz_mode_changed(self, mode: str) -> None:
         self.status.showMessage(f"Visualizer: {mode} (right-click visualizer to cycle)", 2000)
@@ -2215,6 +2277,8 @@ class MainWindow(QMainWindow):
         vol = v / 100.0
         self.audio_player.set_volume(vol)
         self.config.volume = vol
+        if hasattr(self, "vol_pct_label"):
+            self.vol_pct_label.setText(f"{v}%")
 
     def _on_mute_toggled(self, muted: bool) -> None:
         self.audio_player.set_muted(muted)

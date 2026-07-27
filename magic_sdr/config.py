@@ -39,7 +39,12 @@ class Config:
     gain_db: float = 0.0                    # 0 = auto (AGC)
 
     # Audio
-    volume: float = 0.8                     # 0.0 – 1.0
+    # Volume is the user's volume-slider setting (0.0–1.0). Default 0.5
+    # (was 0.8) because the EQ pipeline now normalizes to -6 dBFS by default,
+    # so 0.5 volume gives a comfortable listening level. Users who want louder
+    # audio should increase the Output Gain in the EQ panel, not just the
+    # volume slider.
+    volume: float = 0.5                     # 0.0 – 1.0 (was 0.8)
     audio_sample_rate: int = 48000
     audio_channels: int = 2                 # Gqrx streams stereo for WFM_ST
 
@@ -106,6 +111,17 @@ class Config:
 
     # Brick-wall limiter — prevents clipping regardless of pre-gain/EQ.
     eq_limiter_enabled: bool = True
+
+    # Master output gain (dB) — the PRIMARY loudness control. Applied after
+    # the limiter, before int16 conversion. -60 to 0 dB. Default -6 dB so
+    # the app isn't deafening on first launch. Users should adjust this to
+    # control overall loudness, not the per-band EQ sliders.
+    eq_output_gain_db: float = -6.0
+
+    # Limiter ceiling (dBFS) — the maximum peak level the limiter allows.
+    # Default -3 dBFS (was -0.3) to reduce distortion. Lower = more headroom
+    # but quieter; higher = louder but more distortion on peaks.
+    eq_limiter_ceiling_db: float = -3.0
 
     @classmethod
     def load(cls) -> "Config":

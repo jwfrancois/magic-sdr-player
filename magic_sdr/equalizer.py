@@ -77,15 +77,23 @@ class Equalizer:
         # drive the EQ input harder (positive) or softer (negative) to
         # emphasize the EQ's tonal shaping. Default 0 dB (no change).
         self.pre_gain_db: float = 0.0
-        # Brick-wall limiter — hard ceiling at -0.3 dBFS with look-ahead
+        # Brick-wall limiter — hard ceiling at -3 dBFS with look-ahead
         # to catch inter-sample peaks. Engaged after the EQ filters and
-        # makeup gain, just before the final int16 conversion. Prevents
-        # ANY clipping regardless of how hard the user drives the EQ.
+        # makeup gain, just before the final output gain. Prevents ANY
+        # clipping regardless of how hard the user drives the EQ.
+        # Default ceiling lowered from -0.3 to -3 dBFS to reduce distortion
+        # (the previous -0.3 dBFS was essentially hard clipping on every
+        # peak, producing harsh 'noisy' sound).
         self.limiter_enabled: bool = True
-        self.limiter_ceiling_db: float = -0.3   # ceiling at -0.3 dBFS
+        self.limiter_ceiling_db: float = -3.0    # ceiling at -3 dBFS (was -0.3)
         self._limiter_envelope: float = 1.0
         self._limiter_attack_tau: float = 0.001   # 1 ms attack (very fast)
         self._limiter_release_tau: float = 0.060  # 60 ms release
+        # Output gain (dB) — the MASTER loudness control. Applied AFTER the
+        # limiter, just before int16 conversion. This is what the user should
+        # adjust to control overall loudness. Default -6 dB (half amplitude)
+        # so the app isn't deafening on first launch. Range: -60 to 0 dB.
+        self.output_gain_db: float = -6.0
 
     def set_band_gain(self, band_index: int, gain_db: float) -> None:
         """Set the gain (in dB) of a band."""
@@ -136,6 +144,18 @@ class Equalizer:
         """Set the limiter ceiling in dBFS (-12 to 0 dB)."""
         self.limiter_ceiling_db = max(-12.0, min(0.0, float(ceiling_db)))
 
+    def set_output_gain(self, gain_db: float) -> None:
+        """Set the master output gain in dB (-60 to 0 dB).
+
+        This is the PRIMARY loudness control. Applied after the limiter.
+        Default -6 dB. Use this to make the app quieter or louder without
+        affecting the EQ's tonal shaping.
+        """
+        self.output_gain_db = max(-60.0, min(0.0, float(gain_db)))
+
+    def get_output_gain(self) -> float:
+        return self.output_gain_db
+
     @property
     def enabled(self) -> bool:
         return self._enabled
@@ -185,10 +205,12 @@ class Equalizer:
         Returns:
             int16 ndarray with the same shape as the input.
         """
-        # If EQ is completely off AND no pre-gain AND limiter off, bypass
+        # If EQ is completely off AND no pre-gain AND no output gain AND
+        # limiter off, bypass entirely (return input unchanged)
         eq_active = self._enabled and HAVE_SCIPY and not self.is_flat()
         pre_gain_active = abs(self.pre_gain_db) > 0.01
-        if not eq_active and not pre_gain_active and not self.limiter_enabled:
+        output_gain_active = abs(self.output_gain_db) > 0.01
+        if not eq_active and not pre_gain_active and not output_gain_active and not self.limiter_enabled:
             return chunk
 
         sr = sample_rate or self.sample_rate
@@ -263,7 +285,11 @@ class Equalizer:
             alpha = 1.0 - np.exp(-dt / self._makeup_release_tau)
             self._makeup_peak = self._makeup_peak + alpha * (chunk_peak - self._makeup_peak)
         if self._makeup_peak > 1.0:
-            target_peak = 10 ** (-0.5 / 20.0)  # ~0.944, leaves 0.5 dB headroom
+            # Target -6 dBFS (was -0.5) — leaves much more headroom so the
+            # limiter doesn't have to work as hard, reducing distortion.
+            # The user can boost loudness back up with the output gain or
+            # the volume slider if they want.
+            target_peak = 10 ** (-6.0 / 20.0)  # ~0.501, leaves 6 dB headroom
             scale = target_peak / self._makeup_peak
             audio = audio * scale
 
@@ -299,6 +325,13 @@ class Equalizer:
                 # No limiting needed this chunk — release the envelope
                 alpha = 1.0 - np.exp(-dt / self._limiter_release_tau)
                 self._limiter_envelope = self._limiter_envelope + alpha * (1.0 - self._limiter_envelope)
+
+        # ---- Output gain (MASTER loudness control) ----
+        # Applied AFTER the limiter, BEFORE int16 conversion. This is the
+        # user's primary loudness control. Default -6 dB. The volume slider
+        # in the AudioPlayer is a percentage on top of this.
+        if abs(self.output_gain_db) > 0.01:
+            audio = audio * (10 ** (self.output_gain_db / 20.0))
 
         # Convert back to original dtype
         if original_dtype == np.int16:
