@@ -675,3 +675,85 @@ Stage Summary:
 - Gqrx's audio is automatically muted while Magic SDR is connected
 - Gqrx's audio is restored on disconnect
 - Committed and ready to push to GitHub
+
+---
+Task ID: fix-mute-not-working
+Agent: main
+Task: Fix "Gqrx does not mute. Magic SDR does not play" — previous fix didn't work
+
+Root Cause:
+- In the previous fix (commit ac3efe7), set_audio_gain(0) was inside the
+  `else` branch of `if not audio_player.start()`:
+  
+      if not self.audio_player.start():
+          QMessageBox.warning(...)   # audio failed
+      else:
+          self.gqrx.set_audio_gain(0)   # <-- ONLY runs if audio succeeded
+          ...
+  
+- If AudioPlayer failed (e.g., sounddevice not installed, device busy),
+  the mute command was NEVER sent to Gqrx
+- Result: worst case for the user — Magic SDR silent AND Gqrx unmuted
+- The user saw the error dialog but dismissed it, so didn't realize
+  the mute had also failed
+
+Fix (magic_sdr/main_window.py + magic_sdr/audio_receiver.py):
+
+1. MOVED set_audio_gain(0) BEFORE audio_player.start() so it always runs:
+       mute_ok = self.gqrx.set_audio_gain(0)
+       audio_ok = self.audio_player.start()
+       if not audio_ok:
+           # Show clear error with audio_player.last_error
+           # Gqrx is already muted, so user gets silence (not double audio)
+       else:
+           if mute_ok:
+               # Show success
+           else:
+               # Show "Gqrx mute failed — please mute manually"
+
+2. CAPTURED THE ACTUAL ERROR in AudioPlayer.last_error:
+   - When sounddevice is missing: tells user to "pip install sounddevice"
+   - When device fails to open: shows the actual exception (device busy,
+     unsupported sample rate, etc.)
+   - The error message is shown in the QMessageBox so the user knows
+     EXACTLY what to fix
+
+3. ADDED 4 NEW UI CONTROLS in the Audio section of the left panel:
+   - "Restart Audio" button — retries AudioPlayer.start() without
+     reconnecting Gqrx; plays a 0.5s test tone on success
+   - "Test Audio" button — plays a 1s 440Hz tone through Magic SDR's
+     pipeline; if user hears it, Magic SDR works; if not, the issue
+     is the audio device
+   - "Mute Gqrx" toggle button — manually sends 'L AF 0' / 'L AF 200'
+     over Gqrx remote control; shows clear error if Gqrx refuses
+   - "Audio: PLAYING on <device> (pushed N, pulled N)" status label
+     — green when playing, red when offline or broken; updates every
+     1.5s via the existing diag timer
+     - Detects "BROKEN" state: pushed_count grows but pulled_count
+       stays 0 (callback thread dead)
+
+4. ADDED AudioPlayer.is_running(), pushed_count(), pulled_count(),
+   device_name(), push_raw() methods for the UI
+
+5. ADDED push_raw() — bypasses volume/mute so the test tone is always
+   audible at -6 dBFS regardless of the user's volume slider
+
+Verification:
+- test_audio_recovery_standalone.py: 4 tests pass
+  - Gqrx mute command format correct (L AF 0 / L AF 200)
+  - Connect handler mutes BEFORE AudioPlayer.start() (regression test)
+  - All 4 UI controls + 5 handlers properly defined
+  - Disconnect restores Gqrx audio gain to 200
+- python3 -m py_compile: both files compile cleanly
+
+Stage Summary:
+- Gqrx is now muted UNCONDITIONALLY on connect (regardless of whether
+  Magic SDR's audio works)
+- If Magic SDR's audio fails, user sees the EXACT error message
+  (e.g., "pip install sounddevice") instead of a generic warning
+- User can manually retry audio start with "Restart Audio" button
+- User can manually mute/unmute Gqrx with "Mute Gqrx" toggle
+- User can verify Magic SDR's audio output with "Test Audio" button
+  (plays a 440Hz tone through the full pipeline)
+- Audio status label shows real-time pipeline state (PLAYING / OFFLINE
+  / BROKEN) with device name and push/pull counters

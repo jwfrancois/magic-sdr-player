@@ -363,6 +363,50 @@ class MainWindow(QMainWindow):
         vol_row.addWidget(self.mute_btn)
         ctrl_layout.addRow("Volume:", vol_row)
 
+        # Audio pipeline controls — these let the user recover from a failed
+        # AudioPlayer.start() without restarting the app, and let them manually
+        # toggle Gqrx's mute if the auto-mute command was rejected.
+        audio_row = QHBoxLayout()
+        self.restart_audio_btn = QPushButton("Restart Audio")
+        self.restart_audio_btn.setToolTip(
+            "Retry starting Magic SDR's audio output.\n"
+            "Use this after installing sounddevice, or after closing\n"
+            "another app that was using your speakers exclusively."
+        )
+        self.restart_audio_btn.clicked.connect(self._on_restart_audio)
+        audio_row.addWidget(self.restart_audio_btn)
+
+        self.test_audio_btn = QPushButton("Test Audio")
+        self.test_audio_btn.setToolTip(
+            "Play a 1-second 440 Hz test tone through Magic SDR's audio\n"
+            "output. If you hear it, Magic SDR's audio pipeline works.\n"
+            "If you don't, the problem is your audio device, not the EQ."
+        )
+        self.test_audio_btn.clicked.connect(self._on_test_audio)
+        audio_row.addWidget(self.test_audio_btn)
+
+        self.gqrx_mute_btn = QPushButton("Mute Gqrx")
+        self.gqrx_mute_btn.setCheckable(True)
+        self.gqrx_mute_btn.setToolTip(
+            "Toggle Gqrx's own audio output (sends 'L AF 0' / 'L AF 200' over\n"
+            "remote control). Magic SDR mutes Gqrx automatically on connect,\n"
+            "but you can use this button to manually mute/unmute if needed."
+        )
+        self.gqrx_mute_btn.setChecked(True)  # auto-muted on connect
+        self.gqrx_mute_btn.toggled.connect(self._on_gqrx_mute_toggled)
+        audio_row.addWidget(self.gqrx_mute_btn)
+
+        ctrl_layout.addRow("Audio:", audio_row)
+
+        # Audio pipeline status — single-line readout showing the current
+        # state so the user can immediately see if Magic SDR is playing
+        # and whether the callback thread is actually draining the queue.
+        self.audio_status_lbl = QLabel("Audio: not started")
+        self.audio_status_lbl.setStyleSheet(
+            "color: #ffaa5c; font-family: monospace; font-size: 10px;"
+        )
+        ctrl_layout.addRow(self.audio_status_lbl)
+
         # Signal level bar (using a QProgressBar as a meter) + analog S-meter
         sig_row = QHBoxLayout()
         self.signal_bar = QProgressBar()
@@ -1254,32 +1298,62 @@ class MainWindow(QMainWindow):
             # Start audio + spectrum receivers
             self.audio_receiver.start()
             self.spectrum_receiver.start()
+            # ALWAYS mute Gqrx's own audio output when Magic SDR connects.
+            # This prevents the double-audio problem (Gqrx + Magic SDR both
+            # playing). If we don't mute Gqrx, the user will hear Gqrx's
+            # non-EQ'd audio drowning out Magic SDR's EQ'd audio.
+            mute_ok = self.gqrx.set_audio_gain(0)
             # Start the LOCAL audio playback — this is what actually produces
             # sound from the Magic SDR Player. The audio pipeline is:
             #   Gqrx → UDP → AudioReceiver → EQ → limiter → AudioPlayer → speaker
-            # If AudioPlayer fails to start, the user will hear nothing
-            # (or whatever Gqrx itself plays). Tell them clearly.
-            if not self.audio_player.start():
+            audio_ok = self.audio_player.start()
+            if not audio_ok:
+                # Show the ACTUAL error message from AudioPlayer so the user
+                # knows exactly what to fix (e.g., "pip install sounddevice")
                 QMessageBox.warning(
-                    self, "Audio output unavailable",
-                    "Magic SDR could not open the local audio output device.\n\n"
-                    "You will still see the visualizer, but you will NOT hear\n"
-                    "audio from Magic SDR's EQ/limiter pipeline.\n\n"
-                    "Make sure 'sounddevice' is installed (pip install sounddevice)\n"
-                    "and that no other app has exclusive access to your speakers."
+                    self, "Magic SDR audio output failed",
+                    "Magic SDR could not start its own audio output.\n\n"
+                    "REASON:\n"
+                    f"{self.audio_player.last_error}\n\n"
+                    "Gqrx's own audio output has ALSO been muted, so you\n"
+                    "will hear SILENCE until Magic SDR's audio works.\n\n"
+                    "How to fix:\n"
+                    "  1. Install sounddevice:  pip install sounddevice\n"
+                    "  2. Make sure no other app is using your speakers\n"
+                    "  3. Click 'Restart Audio' in the Magic SDR toolbar\n"
+                    "  4. Click 'Test Audio' to verify Magic SDR can play sound\n\n"
+                    "If you want to hear Gqrx's audio again instead, click\n"
+                    "the 'Unmute Gqrx' button in the toolbar."
+                )
+                self.status.showMessage(
+                    "Magic SDR audio FAILED to start — Gqrx muted for silence. "
+                    "Install sounddevice, then click 'Restart Audio'.",
+                    15000,
                 )
             else:
-                # Mute Gqrx's own audio output (AF gain = 0) so the user
-                # ONLY hears the EQ'd audio from Magic SDR. Otherwise both
-                # Gqrx and Magic SDR would play simultaneously, doubling
-                # the audio and making the EQ sound like it has no effect
-                # (because the bypassed Gqrx audio dominates).
-                self.gqrx.set_audio_gain(0)
-                self.status.showMessage(
-                    "Audio pipeline active. Gqrx's own audio muted — "
-                    "you now hear ONLY Magic SDR's EQ'd audio.",
-                    10000,
-                )
+                if mute_ok:
+                    self.status.showMessage(
+                        f"Audio pipeline active on '{self.audio_player.device_name()}'. "
+                        "Gqrx's own audio muted — you now hear ONLY Magic SDR's EQ'd audio.",
+                        10000,
+                    )
+                else:
+                    # Audio works but Gqrx refused the mute — user will hear both
+                    QMessageBox.warning(
+                        self, "Could not mute Gqrx",
+                        "Magic SDR's audio is now playing, but Gqrx did NOT\n"
+                        "accept the mute command (its 'L AF 0' remote control\n"
+                        "request returned an error).\n\n"
+                        "You will hear BOTH Gqrx and Magic SDR simultaneously.\n"
+                        "Please manually set Gqrx's audio gain slider to 0 in\n"
+                        "the Gqrx window to silence it.\n\n"
+                        "You can also use the 'Mute Gqrx' button in the Magic\n"
+                        "SDR toolbar to retry."
+                    )
+                    self.status.showMessage(
+                        "Magic SDR playing. PLEASE mute Gqrx manually — "
+                        "the remote mute command failed.", 15000,
+                    )
             # Restore state
             self.gqrx.set_frequency(self.config.last_frequency_hz)
             self.gqrx.set_modulation(self.config.last_modulation)
@@ -1326,6 +1400,8 @@ class MainWindow(QMainWindow):
           - Set RF Gain > 0
         These are the common causes of "0 stations found" and a black waterfall.
         """
+        # Also refresh the audio status label while we're here (called every 1.5s)
+        self._update_audio_status_label()
         if not self.gqrx.is_connected():
             self.diag_banner.setVisible(False)
             return
@@ -2143,6 +2219,152 @@ class MainWindow(QMainWindow):
     def _on_mute_toggled(self, muted: bool) -> None:
         self.audio_player.set_muted(muted)
         self.mute_btn.setText("🔇" if muted else "🔊")
+
+    def _on_restart_audio(self) -> None:
+        """Retry starting Magic SDR's audio output without reconnecting Gqrx.
+
+        Useful after the user installs sounddevice, closes another app
+        that was holding the speakers, or changes their default audio
+        device. After restart, plays a short test tone so the user can
+        immediately verify whether sound is now coming out of Magic SDR.
+        """
+        try:
+            self.audio_player.stop()
+        except Exception:
+            pass
+        ok = self.audio_player.start()
+        if ok:
+            self.status.showMessage(
+                f"Audio restarted on '{self.audio_player.device_name()}'.",
+                4000,
+            )
+            # Play a 0.5 s test tone so the user can immediately hear
+            # that Magic SDR is now producing sound.
+            self._play_test_tone(duration_s=0.5)
+        else:
+            QMessageBox.warning(
+                self, "Audio restart failed",
+                f"Magic SDR still cannot start audio output:\n\n"
+                f"{self.audio_player.last_error}\n\n"
+                "Please address the issue above, then click 'Restart Audio' again."
+            )
+
+    def _on_test_audio(self) -> None:
+        """Play a 1-second 440 Hz test tone through Magic SDR's pipeline.
+
+        If the user hears it, Magic SDR's audio output works. If they
+        don't, the issue is their audio device, not the EQ. Also useful
+        for distinguishing 'EQ has no effect' from 'no sound at all'.
+        """
+        if not self.audio_player.is_running():
+            QMessageBox.warning(
+                self, "Audio not running",
+                "Magic SDR's audio output is not running.\n\n"
+                f"Reason: {self.audio_player.last_error or 'not started'}\n\n"
+                "Click 'Restart Audio' after fixing the issue above."
+            )
+            return
+        self._play_test_tone(duration_s=1.0)
+        self.status.showMessage(
+            "Test tone playing — you should hear a 440 Hz beep from Magic SDR.",
+            4000,
+        )
+
+    def _play_test_tone(self, duration_s: float = 1.0, freq_hz: float = 440.0) -> None:
+        """Generate and push a sine wave test tone through the AudioPlayer.
+
+        Uses push_raw() to bypass the user's volume slider so the tone
+        is always audible at a fixed comfortable level (-6 dBFS).
+        """
+        try:
+            sr = self.audio_player.sample_rate
+            n = int(sr * duration_s)
+            t = np.linspace(0, duration_s, n, endpoint=False)
+            # -6 dBFS = 0.5 amplitude
+            tone = (np.sin(2 * np.pi * freq_hz * t) * 0.5 * 32767).astype(np.int16)
+            # Stereo if needed
+            if self.audio_player.channels == 2:
+                tone = np.column_stack([tone, tone])
+            # Apply a short fade-in/out to avoid clicks
+            fade = int(sr * 0.01)
+            if fade > 0 and fade * 2 < n:
+                env = np.linspace(0, 1, fade)
+                tone[:fade] = (tone[:fade].astype(np.float32) * env[:, None] if tone.ndim == 2 else tone[:fade].astype(np.float32) * env).astype(np.int16)
+                env = np.linspace(1, 0, fade)
+                tone[-fade:] = (tone[-fade:].astype(np.float32) * (env[:, None] if tone.ndim == 2 else env)).astype(np.int16)
+            # Push in 1024-sample chunks so the queue doesn't overflow
+            chunk_size = 1024
+            for i in range(0, len(tone), chunk_size):
+                self.audio_player.push_raw(tone[i:i + chunk_size])
+        except Exception as e:
+            log.error("Test tone failed: %s", e)
+
+    def _on_gqrx_mute_toggled(self, muted: bool) -> None:
+        """Toggle Gqrx's own audio output via remote control 'L AF' command.
+
+        muted=True  -> sends 'L AF 0'    (Gqrx silent)
+        muted=False -> sends 'L AF 200'  (Gqrx moderate listening level)
+        """
+        if not self.gqrx.is_connected():
+            self.status.showMessage("Not connected to Gqrx — cannot toggle mute.", 3000)
+            self.gqrx_mute_btn.blockSignals(True)
+            self.gqrx_mute_btn.setChecked(False)
+            self.gqrx_mute_btn.blockSignals(False)
+            return
+        if muted:
+            ok = self.gqrx.set_audio_gain(0)
+            self.gqrx_mute_btn.setText("Mute Gqrx" if not muted else "Gqrx Muted")
+            if ok:
+                self.status.showMessage("Gqrx muted (L AF 0). You should only hear Magic SDR.", 3000)
+            else:
+                QMessageBox.warning(
+                    self, "Gqrx mute failed",
+                    "Gqrx did not accept the 'L AF 0' command.\n\n"
+                    "Please mute Gqrx manually by dragging its audio gain\n"
+                    "slider to 0 in the Gqrx window."
+                )
+        else:
+            ok = self.gqrx.set_audio_gain(200)
+            self.gqrx_mute_btn.setText("Mute Gqrx")
+            if ok:
+                self.status.showMessage("Gqrx unmuted (L AF 200). You will hear both.", 3000)
+            else:
+                QMessageBox.warning(
+                    self, "Gqrx unmute failed",
+                    "Gqrx did not accept the 'L AF 200' command.\n\n"
+                    "Please adjust Gqrx's audio gain slider manually."
+                )
+
+    def _update_audio_status_label(self) -> None:
+        """Refresh the 'Audio: ...' status label. Called from the diag timer."""
+        if not hasattr(self, "audio_status_lbl"):
+            return
+        if self.audio_player.is_running():
+            pushed = self.audio_player.pushed_count()
+            pulled = self.audio_player.pulled_count()
+            dev = self.audio_player.device_name()
+            if pulled == 0 and pushed > 5:
+                # Callback thread isn't draining — stream may be dead
+                self.audio_status_lbl.setText(
+                    f"Audio: BROKEN (pushed {pushed}, pulled 0) on {dev}"
+                )
+                self.audio_status_lbl.setStyleSheet(
+                    "color: #ff5c5c; font-family: monospace; font-size: 10px;"
+                )
+            else:
+                self.audio_status_lbl.setText(
+                    f"Audio: PLAYING on {dev}  (pushed {pushed}, pulled {pulled})"
+                )
+                self.audio_status_lbl.setStyleSheet(
+                    "color: #5cffaa; font-family: monospace; font-size: 10px;"
+                )
+        else:
+            self.audio_status_lbl.setText(
+                f"Audio: OFFLINE — {self.audio_player.last_error[:60] or 'not started'}"
+            )
+            self.audio_status_lbl.setStyleSheet(
+                "color: #ff5c5c; font-family: monospace; font-size: 10px;"
+            )
 
     def _on_record_toggled(self, on: bool) -> None:
         if on:

@@ -181,14 +181,36 @@ class AudioPlayer:
         self._volume = 0.8
         self._muted = False
         self._running = False
+        # Last error message — exposed so the UI can show the user EXACTLY
+        # why playback failed (instead of a generic "couldn't start").
+        self.last_error: str = ""
+        # Total chunks pushed and pulled — used by the UI to detect if the
+        # callback thread is actually draining the queue.
+        self._pushed_count: int = 0
+        self._pulled_count: int = 0
+        # Audio output device name (informational)
+        self._device_name: str = ""
 
     def start(self) -> bool:
+        self.last_error = ""
         try:
             import sounddevice as sd
         except Exception as e:
+            self.last_error = (
+                f"The 'sounddevice' Python package is not installed ({e}).\n\n"
+                "Install it with: pip install sounddevice\n"
+                "(It is already listed in requirements.txt — you may need\n"
+                "to recreate your virtualenv.)"
+            )
             log.error("sounddevice not available: %s", e)
             return False
         try:
+            # Remember which device we're using for UI display
+            try:
+                default_out = sd.query_devices(sd.default.device[1])
+                self._device_name = default_out.get("name", "default")
+            except Exception:
+                self._device_name = "default"
             self._sd_stream = sd.RawOutputStream(
                 samplerate=self.sample_rate,
                 channels=self.channels,
@@ -198,12 +220,39 @@ class AudioPlayer:
             )
             self._sd_stream.start()
             self._running = True
-            log.info("AudioPlayer started: %d Hz, %d ch", self.sample_rate, self.channels)
+            log.info("AudioPlayer started: %d Hz, %d ch, device=%s",
+                     self.sample_rate, self.channels, self._device_name)
             return True
         except Exception as e:
+            self.last_error = (
+                f"sounddevice is installed, but the audio output stream\n"
+                f"could not be opened:\n\n"
+                f"    {type(e).__name__}: {e}\n\n"
+                "This usually means another app has exclusive access to\n"
+                "your speakers, or your audio device doesn't support\n"
+                f"{self.sample_rate} Hz / {self.channels}-channel output."
+            )
             log.error("Failed to open audio output: %s", e)
             self._running = False
             return False
+
+    def device_name(self) -> str:
+        """Return the name of the audio output device, for UI display."""
+        return self._device_name or "(not started)"
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def pushed_count(self) -> int:
+        """Total chunks pushed by the producer (EQ/limiter output)."""
+        return self._pushed_count
+
+    def pulled_count(self) -> int:
+        """Total chunks pulled by the sounddevice callback thread.
+
+        If pushed_count grows but pulled_count stays 0, the callback
+        thread is dead (e.g., the stream was closed unexpectedly)."""
+        return self._pulled_count
 
     def stop(self) -> None:
         self._running = False
@@ -219,6 +268,7 @@ class AudioPlayer:
         """Accept a chunk (int16) for playback. Drops if buffer is full."""
         if not self._running:
             return
+        self._pushed_count += 1
         # Apply volume
         if self._muted or self._volume == 0.0:
             chunk = np.zeros_like(chunk)
@@ -238,6 +288,7 @@ class AudioPlayer:
         # sounddevice wants `frames` samples per channel
         try:
             chunk = self._q.get_nowait()
+            self._pulled_count += 1
         except queue.Empty:
             outdata.fill(0)
             return
@@ -254,6 +305,22 @@ class AudioPlayer:
             try:
                 self._q.put_nowait(chunk[n:])
             except queue.Full:
+                pass
+
+    def push_raw(self, chunk: np.ndarray) -> None:
+        """Push a chunk bypassing the volume/mute controls — used by the
+        'Test Audio' button so the test tone is always audible at full
+        amplitude regardless of the user's volume slider setting."""
+        if not self._running:
+            return
+        self._pushed_count += 1
+        try:
+            self._q.put_nowait(chunk)
+        except queue.Full:
+            try:
+                self._q.get_nowait()
+                self._q.put_nowait(chunk)
+            except Exception:
                 pass
 
     def set_volume(self, v: float) -> None:
