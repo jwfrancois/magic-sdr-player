@@ -532,3 +532,41 @@ Stage Summary:
 - Individual panels can be re-enabled even while compact is on
 - Reset Window Layout restores everything in one click
 - State persists across app restarts
+
+---
+Task ID: eq-clipping-fix
+Agent: main
+Task: Fix EQ presets having no audible effect on sound
+
+Root Cause Analysis:
+- The EQ DSP, wiring, and preset application were all verified CORRECT via
+  scripts/test_eq_effect.py (Bass Boost produced +13.75 dB at 31 Hz in isolation)
+- scripts/test_eq_runtime.py confirmed audio_player receives the EQ'd chunk (+11.83 dB)
+- The actual bug: scripts/test_eq_clipping.py showed 69.64% of samples were CLIPPING
+  for Bass Boost on a near-full-scale signal
+- Gqrx sends audio near 0 dBFS; a +12 dB bass boost pushes it way past int16 range
+- np.clip() smashed the peaks into square waves → harsh distortion that masked the
+  EQ's tonal change → user perceived "no effect"
+
+Fix (magic_sdr/equalizer.py):
+- Added peak-envelope makeup-gain follower to Equalizer.process()
+- _makeup_peak tracks recent peak amplitude (1.0 = full scale)
+- Attack tau = 5 ms (catches peaks fast)
+- Release tau = 500 ms (prevents loudness pumping)
+- Only attenuates when envelope > 1.0 (quiet passages pass through uncolored)
+- Target peak = 0.944 (-0.5 dB headroom)
+- Reset _makeup_peak in reset() to avoid stale state across preset changes
+
+Verification:
+- test_eq_clipping.py: 0% clipping on all presets (was 69.64% for Bass Boost)
+- test_eq_realistic.py: on -12 dBFS signal, Bass Boost gives +13.31 dB bass
+  boost with 0% clipping — clearly audible
+- test_eq_effect.py: tonal balance preserved (bass/mid ratio ~14 dB)
+- test_eq_runtime.py: end-to-end, audio_player receives +9.94 dB boost
+- functional_test.py: all tests pass
+
+Stage Summary:
+- EQ presets now produce clearly audible tonal changes
+- No clipping distortion on any preset
+- Quiet audio passes through without unnecessary attenuation
+- Committed df45198, pushed to GitHub
